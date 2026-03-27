@@ -1249,38 +1249,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def select_runs_by_max_length(
-    predictions: pd.DataFrame,
-    target_channels: list[str],
-    max_run_points: int,
-) -> pd.DataFrame:
-    selected = predictions.copy()
-    values = selected[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = values[:, channel_index].copy()
-        run_start: int | None = None
-
-        for index, value in enumerate(series):
-            if value == 1:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            if (run_stop - run_start) > max_run_points:
-                series[run_start:run_stop] = 0
-            run_start = None
-
-        if run_start is not None and (len(series) - run_start) > max_run_points:
-            series[run_start:] = 0
-
-        selected[channel] = series
-
-    return selected
-
-
 def prune_weak_isolated_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1503,14 +1471,9 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    memory_candidate_predictions = select_runs_by_max_length(
-        predictions=baseline_predictions,
-        target_channels=args.target_channels,
-        max_run_points=12,
-    )
-    _, suppressed_events = apply_same_channel_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
-        predictions=memory_candidate_predictions,
+        predictions=baseline_predictions,
         target_channels=args.target_channels,
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
@@ -1518,9 +1481,6 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = baseline_predictions.copy()
-    for row in suppressed_events.itertuples(index=False):
-        gated_predictions.loc[pd.Timestamp(row.start_time) : pd.Timestamp(row.end_time), row.channel] = 0
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
