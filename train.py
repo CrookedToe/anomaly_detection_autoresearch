@@ -323,8 +323,6 @@ class TcnAnomalyPipeline:
         self.scaler: FeatureScaler | None = None
         self.model: SelfSupervisedTcnForecaster | None = None
         self.global_thresholds: np.ndarray | None = None
-        self.forecast_scale_thresholds: np.ndarray | None = None
-        self.reconstruction_scale_thresholds: np.ndarray | None = None
         self.use_amp = self.device.type == "cuda" and config.mixed_precision
         self.cp = self._try_load_cupy()
 
@@ -470,12 +468,12 @@ class TcnAnomalyPipeline:
         scores = np.where(covered, combined, 0.0).astype(np.float32)
         return pd.DataFrame(scores, index=frame.index, columns=self.target_channels)
 
-    def _aggregate_component_scores(
+    def _aggregate_scores(
         self,
         frame: pd.DataFrame,
         stride: int | None = None,
         window_starts: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before scoring.")
 
@@ -576,26 +574,15 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
+        combined = (
+            self.config.forecast_score_weight * forecast_scores
+            + self.config.reconstruction_score_weight * recon_scores
+        )
         covered = (forecast_count > 0) | (recon_count > 0)
 
         if self.cp is not None:
-            forecast_scores = self.cp.asnumpy(forecast_scores)
-            recon_scores = self.cp.asnumpy(recon_scores)
+            combined = self.cp.asnumpy(combined)
             covered = self.cp.asnumpy(covered)
-        return forecast_scores.astype(np.float32), recon_scores.astype(np.float32), covered.astype(bool)
-
-    def _aggregate_scores(
-        self,
-        frame: pd.DataFrame,
-        stride: int | None = None,
-        window_starts: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        forecast_scores, recon_scores, covered = self._aggregate_component_scores(
-            frame=frame,
-            stride=stride,
-            window_starts=window_starts,
-        )
-        combined = self._combine_component_scores(forecast_scores, recon_scores)
         return combined.astype(np.float32), covered.astype(bool)
 
     def predict(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -669,12 +656,6 @@ class TcnAnomalyPipeline:
                 "nominal_dt_seconds": self.scaler.nominal_dt_seconds,
             },
             "global_thresholds": None if self.global_thresholds is None else self.global_thresholds.tolist(),
-            "forecast_scale_thresholds": None
-            if self.forecast_scale_thresholds is None
-            else self.forecast_scale_thresholds.tolist(),
-            "reconstruction_scale_thresholds": None
-            if self.reconstruction_scale_thresholds is None
-            else self.reconstruction_scale_thresholds.tolist(),
             "metadata": metadata,
         }
         torch.save(payload, path)
@@ -898,14 +879,11 @@ class TcnAnomalyPipeline:
         return processed
 
     def _calibrate_thresholds(self, train_df: pd.DataFrame, train_starts: np.ndarray) -> np.ndarray:
-        forecast_scores, recon_scores, covered = self._aggregate_component_scores(
+        combined, covered = self._aggregate_scores(
             frame=train_df,
             stride=self.config.train_stride,
             window_starts=train_starts,
         )
-        self.forecast_scale_thresholds = self._calibrate_component_scales(forecast_scores, covered)
-        self.reconstruction_scale_thresholds = self._calibrate_component_scales(recon_scores, covered)
-        combined = self._combine_component_scores(forecast_scores, recon_scores)
         thresholds = np.zeros(len(self.target_channels), dtype=np.float32)
         for channel_index in range(len(self.target_channels)):
             valid_scores = combined[covered[:, channel_index], channel_index]
@@ -914,41 +892,6 @@ class TcnAnomalyPipeline:
                 continue
             thresholds[channel_index] = float(np.quantile(valid_scores, self.config.calibration_quantile))
         return thresholds
-
-    def _calibrate_component_scales(self, scores: np.ndarray, covered: np.ndarray) -> np.ndarray:
-        scales = np.ones(len(self.target_channels), dtype=np.float32)
-        for channel_index in range(len(self.target_channels)):
-            valid_scores = scores[covered[:, channel_index], channel_index]
-            if len(valid_scores) == 0:
-                continue
-            scales[channel_index] = max(
-                float(np.quantile(valid_scores, self.config.calibration_quantile)),
-                EPSILON,
-            )
-        return scales
-
-    def _combine_component_scores(
-        self,
-        forecast_scores: np.ndarray,
-        recon_scores: np.ndarray,
-    ) -> np.ndarray:
-        forecast_scale = self.forecast_scale_thresholds
-        if forecast_scale is None:
-            forecast_scale = np.ones(len(self.target_channels), dtype=np.float32)
-        recon_scale = self.reconstruction_scale_thresholds
-        if recon_scale is None:
-            recon_scale = np.ones(len(self.target_channels), dtype=np.float32)
-
-        forecast_norm = forecast_scores / np.maximum(forecast_scale.reshape(1, -1), EPSILON)
-        recon_norm = recon_scores / np.maximum(recon_scale.reshape(1, -1), EPSILON)
-
-        weight_sum = max(self.config.forecast_score_weight + self.config.reconstruction_score_weight, EPSILON)
-        balanced = (
-            self.config.forecast_score_weight * forecast_norm
-            + self.config.reconstruction_score_weight * recon_norm
-        ) / weight_sum
-        peak_sensitive = np.maximum(forecast_norm, recon_norm)
-        return (0.7 * balanced + 0.3 * peak_sensitive).astype(np.float32)
 
     def _pad_or_trim_window(self, window: pd.DataFrame) -> pd.DataFrame:
         target_window = window.copy()
@@ -1306,6 +1249,112 @@ def merge_supported_close_runs(
     return merged
 
 
+def extend_supported_run_edges(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray | None,
+    support_padding: int,
+    max_extension_points: int,
+    min_score_ratio: float,
+) -> pd.DataFrame:
+    if global_thresholds is None:
+        return predictions
+
+    extended = predictions.copy()
+    values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        base_threshold = float(global_thresholds[channel_index])
+        if base_threshold <= 0.0:
+            continue
+
+        series = values[:, channel_index].copy()
+        channel_scores = scores[channel].to_numpy(dtype=np.float32, copy=False)
+        run_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 1 and run_start is None:
+                run_start = index
+                continue
+            if value == 1:
+                continue
+            if run_start is None:
+                continue
+            series = _extend_run_edges_with_support(
+                series=series,
+                values=values,
+                channel_index=channel_index,
+                channel_scores=channel_scores,
+                run_start=run_start,
+                run_stop=index,
+                base_threshold=base_threshold,
+                support_padding=support_padding,
+                max_extension_points=max_extension_points,
+                min_score_ratio=min_score_ratio,
+            )
+            run_start = None
+
+        if run_start is not None:
+            series = _extend_run_edges_with_support(
+                series=series,
+                values=values,
+                channel_index=channel_index,
+                channel_scores=channel_scores,
+                run_start=run_start,
+                run_stop=len(series),
+                base_threshold=base_threshold,
+                support_padding=support_padding,
+                max_extension_points=max_extension_points,
+                min_score_ratio=min_score_ratio,
+            )
+        extended[channel] = series
+
+    return extended
+
+
+def _extend_run_edges_with_support(
+    series: np.ndarray,
+    values: np.ndarray,
+    channel_index: int,
+    channel_scores: np.ndarray,
+    run_start: int,
+    run_stop: int,
+    base_threshold: float,
+    support_padding: int,
+    max_extension_points: int,
+    min_score_ratio: float,
+) -> np.ndarray:
+    min_score = base_threshold * min_score_ratio
+
+    steps = 0
+    position = run_start - 1
+    while position >= 0 and steps < max_extension_points and series[position] == 0:
+        support_start = max(0, position - support_padding)
+        support_stop = min(len(series), position + support_padding + 1)
+        support = values[support_start:support_stop].copy()
+        support[:, channel_index] = 0
+        if not support.any() or float(channel_scores[position]) < min_score:
+            break
+        series[position] = 1
+        position -= 1
+        steps += 1
+
+    steps = 0
+    position = run_stop
+    while position < len(series) and steps < max_extension_points and series[position] == 0:
+        support_start = max(0, position - support_padding)
+        support_stop = min(len(series), position + support_padding + 1)
+        support = values[support_start:support_stop].copy()
+        support[:, channel_index] = 0
+        if not support.any() or float(channel_scores[position]) < min_score:
+            break
+        series[position] = 1
+        position += 1
+        steps += 1
+
+    return series
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1375,6 +1424,15 @@ def run_tcn_split(
         target_channels=args.target_channels,
         max_gap_points=8,
         support_padding=8,
+    )
+    baseline_predictions = extend_supported_run_edges(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        support_padding=8,
+        max_extension_points=3,
+        min_score_ratio=0.85,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
