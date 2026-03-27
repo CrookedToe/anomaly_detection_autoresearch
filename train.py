@@ -849,20 +849,34 @@ class TcnAnomalyPipeline:
             threshold_cache[channel] = threshold_values
 
         if len(self.target_channels) > 1:
-            support_window = 8
-            near_threshold_ratio = 0.85
             prediction_frame = pd.DataFrame(raw_predictions, index=scores.index, columns=self.target_channels)
+            support_window = 8
+            near_threshold_ratio = 0.8
+            max_gap_points = 8
             for channel in self.target_channels:
+                series = raw_predictions[channel].copy()
                 support = prediction_frame.drop(columns=channel).max(axis=1)
-                supported_near_hits = (
+                supported = (
                     support.rolling((2 * support_window) + 1, min_periods=1, center=True).max().to_numpy(dtype=np.uint8)
                     > 0
                 )
-                near_threshold = smoothed_cache[channel] > (threshold_cache[channel] * near_threshold_ratio)
-                raw_predictions[channel] = np.maximum(
-                    raw_predictions[channel],
-                    (supported_near_hits & near_threshold).astype(np.uint8),
-                )
+                zero_start: int | None = None
+                for index, value in enumerate(series):
+                    if value == 0:
+                        if zero_start is None:
+                            zero_start = index
+                        continue
+                    if zero_start is None:
+                        continue
+                    gap_length = index - zero_start
+                    if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
+                        gap_near_threshold = smoothed_cache[channel][zero_start:index] > (
+                            threshold_cache[channel][zero_start:index] * near_threshold_ratio
+                        )
+                        if supported[zero_start:index].any() and gap_near_threshold.any():
+                            series[zero_start:index] = 1
+                    zero_start = None
+                raw_predictions[channel] = series
 
         for channel in self.target_channels:
             thresholded[channel] = self._postprocess_prediction_runs(raw_predictions[channel])
