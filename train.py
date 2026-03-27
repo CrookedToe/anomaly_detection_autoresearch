@@ -1388,8 +1388,10 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = ((gated_predictions[target_channels] | protected_predictions[target_channels]).astype(np.uint8)).reindex(
-        columns=target_channels
+    gated_predictions = (
+        (gated_predictions[args.target_channels] | protected_predictions[args.target_channels]).astype(np.uint8)
+    ).reindex(
+        columns=args.target_channels
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
