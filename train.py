@@ -816,9 +816,6 @@ class TcnAnomalyPipeline:
     def _dynamic_threshold(self, scores: pd.DataFrame) -> pd.DataFrame:
         thresholded = pd.DataFrame(index=scores.index)
         global_thresholds = self.global_thresholds if self.global_thresholds is not None else np.zeros(len(self.target_channels))
-        persistence_window = 17
-        persistence_floor_ratio = 0.9
-        persistence_activation_ratio = 0.75
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
@@ -831,13 +828,6 @@ class TcnAnomalyPipeline:
                 min_periods=1,
             ).max()
             smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
-            persistence_mean = series.rolling(persistence_window, min_periods=1).mean().astype(np.float32)
-            persistence_signal = persistence_mean.where(
-                (persistence_mean >= (global_thresholds[channel_index] * persistence_floor_ratio))
-                & (smoothed_series >= (global_thresholds[channel_index] * persistence_activation_ratio)),
-                0.0,
-            )
-            prediction_signal = np.maximum(smoothed_series, persistence_signal)
             threshold_source = smoothed_series.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
@@ -849,7 +839,7 @@ class TcnAnomalyPipeline:
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            raw_prediction = (prediction_signal > threshold).astype(np.uint8).to_numpy(copy=True)
+            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
@@ -1001,7 +991,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_epochs": 4,
     "tcn_mask_ratio": 0.15,
     "tcn_train_stride": 8,
-    "tcn_inference_stride": 16,
+    "tcn_inference_stride": 8,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
