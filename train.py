@@ -1506,6 +1506,77 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def prune_reactivated_hitchhiker_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_gap_points: int,
+    max_run_points: int,
+    min_other_support: int,
+    max_start_score_ratio: float,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = float(thresholds[channel_index])
+        previous_run_stop: int | None = None
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            if previous_run_stop is None:
+                previous_run_stop = run_stop
+                continue
+
+            gap_start = previous_run_stop
+            gap_length = run_start - gap_start
+            run_length = run_stop - run_start
+            if gap_length < min_gap_points or run_length > max_run_points:
+                previous_run_stop = run_stop
+                continue
+
+            gap_support = prediction_values[gap_start:run_start].copy()
+            gap_support[:, channel_index] = 0
+            run_support = prediction_values[run_start:run_stop].copy()
+            run_support[:, channel_index] = 0
+            if gap_support.size == 0 or run_support.size == 0:
+                previous_run_stop = run_stop
+                continue
+
+            if (
+                float(gap_support.sum(axis=1).mean()) < min_other_support
+                or float(run_support.sum(axis=1).mean()) < min_other_support
+            ):
+                previous_run_stop = run_stop
+                continue
+
+            start_score_ratio = float(channel_scores[run_start]) / threshold
+            if start_score_ratio > max_start_score_ratio:
+                previous_run_stop = run_stop
+                continue
+
+            series[run_start:run_stop] = 0
+            previous_run_stop = run_stop
+
+        pruned[channel] = series
+
+    return pruned
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1593,6 +1664,16 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = prune_reactivated_hitchhiker_runs(
+        predictions=gated_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_gap_points=4,
+        max_run_points=12,
+        min_other_support=3,
+        max_start_score_ratio=0.85,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
