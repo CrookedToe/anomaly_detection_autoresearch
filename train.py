@@ -492,14 +492,12 @@ class TcnAnomalyPipeline:
             xp = self.cp
             forecast_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
-            forecast_peak = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
         else:
             xp = np
             forecast_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
-            forecast_peak = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
 
@@ -542,11 +540,6 @@ class TcnAnomalyPipeline:
                             future_indices[valid_mask],
                             1.0,
                         )
-                        self.cp.maximum.at(
-                            forecast_peak[:, channel_index],
-                            future_indices[valid_mask],
-                            forecast_error[:, :, channel_index][valid_mask],
-                        )
                 else:
                     forecast_error = forecast_error_t.cpu().numpy()
                     reconstruction_error = reconstruction_error_t.cpu().numpy()
@@ -564,30 +557,16 @@ class TcnAnomalyPipeline:
                                 break
                             forecast_sum[future_index] += forecast_error[row_index, horizon_offset]
                             forecast_count[future_index] += 1.0
-                            forecast_peak[future_index] = np.maximum(
-                                forecast_peak[future_index],
-                                forecast_error[row_index, horizon_offset],
-                            )
 
         if self.cp is not None:
-            forecast_mean = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
-            forecast_scores = xp.where(
-                forecast_count > 0,
-                (0.6 * forecast_mean) + (0.4 * forecast_peak),
-                0.0,
-            )
+            forecast_scores = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
             recon_scores = xp.where(recon_count > 0, recon_sum / xp.maximum(recon_count, 1.0), 0.0)
         else:
-            forecast_mean = np.divide(
+            forecast_scores = np.divide(
                 forecast_sum,
                 np.maximum(forecast_count, 1.0),
                 out=np.zeros_like(forecast_sum),
                 where=forecast_count > 0,
-            )
-            forecast_scores = np.where(
-                forecast_count > 0,
-                (0.6 * forecast_mean) + (0.4 * forecast_peak),
-                0.0,
             )
             recon_scores = np.divide(
                 recon_sum,
@@ -1484,6 +1463,62 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
+def restore_strong_removed_runs(
+    raw_predictions: pd.DataFrame,
+    cleaned_predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    min_peak_ratio: float,
+    min_mean_ratio: float,
+) -> pd.DataFrame:
+    restored = cleaned_predictions.copy()
+    raw_values = raw_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    cleaned_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        raw_series = raw_values[:, channel_index]
+        cleaned_series = cleaned_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(raw_series):
+            if raw_series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(raw_series) and raw_series[index] == 1:
+                index += 1
+            run_stop = index
+
+            if cleaned_series[run_start:run_stop].any():
+                continue
+
+            run_length = run_stop - run_start
+            if run_length > max_run_points:
+                continue
+
+            segment = channel_scores[run_start:run_stop]
+            if len(segment) == 0:
+                continue
+
+            peak_ratio = float(segment.max()) / threshold
+            mean_ratio = float(segment.mean()) / threshold
+            if peak_ratio < min_peak_ratio or mean_ratio < min_mean_ratio:
+                continue
+
+            cleaned_series[run_start:run_stop] = 1
+
+        restored[channel] = cleaned_series
+
+    return restored
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1542,6 +1577,7 @@ def run_tcn_split(
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
+    raw_baseline_predictions = baseline_predictions.copy()
     baseline_predictions = prune_short_isolated_runs(
         predictions=baseline_predictions,
         target_channels=args.target_channels,
@@ -1588,6 +1624,16 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
+    )
+    baseline_predictions = restore_strong_removed_runs(
+        raw_predictions=raw_baseline_predictions,
+        cleaned_predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        max_run_points=8,
+        min_peak_ratio=1.6,
+        min_mean_ratio=1.05,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
