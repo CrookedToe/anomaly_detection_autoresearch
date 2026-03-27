@@ -597,13 +597,12 @@ class TcnAnomalyPipeline:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before vectorizing windows.")
         if len(windows) == 0:
-            embedding_dim = self.config.embedding_dim + (len(self.target_channels) * 3)
+            embedding_dim = self.config.embedding_dim
             return np.zeros((0, embedding_dim), dtype=np.float32)
 
         self.model.eval()
         batch_size = max(1, self.config.batch_size)
         embeddings: list[np.ndarray] = []
-        summary_features: list[np.ndarray] = []
 
         with torch.no_grad():
             for batch_start in range(0, len(windows), batch_size):
@@ -626,28 +625,21 @@ class TcnAnomalyPipeline:
                     base_features = np.concatenate([raw_normalized, dt_template, gap_template], axis=2).astype(np.float32)
                     mask_indicator = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
-                    window_summary_input = raw_normalized.astype(np.float32)
                 else:
                     model_inputs_list: list[np.ndarray] = []
-                    normalized_targets_list: list[np.ndarray] = []
                     for window in batch_windows:
                         padded = self._pad_or_trim_window(window)
-                        base_features, normalized_targets = self._transform_frame(padded)
+                        base_features, _ = self._transform_frame(padded)
                         mask_indicator = np.zeros((len(base_features), 1), dtype=np.float32)
                         model_inputs_list.append(np.concatenate([base_features, mask_indicator], axis=1))
-                        normalized_targets_list.append(normalized_targets)
                     model_inputs = np.asarray(model_inputs_list, dtype=np.float32)
-                    window_summary_input = np.asarray(normalized_targets_list, dtype=np.float32)
 
                 tensor = torch.from_numpy(np.asarray(model_inputs, dtype=np.float32)).float().to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     _, _, embedding = self.model(tensor)
                 embeddings.append(embedding.cpu().numpy().astype(np.float32))
-                summary_features.append(self._summarize_window_values(window_summary_input))
 
-        combined = np.concatenate([np.concatenate(embeddings, axis=0), np.concatenate(summary_features, axis=0)], axis=1)
-        norms = np.linalg.norm(combined, axis=1, keepdims=True)
-        return np.divide(combined, np.maximum(norms, EPSILON), out=np.zeros_like(combined), where=norms > 0.0)
+        return np.concatenate(embeddings, axis=0)
 
     def save(self, path: Path, metadata: dict[str, Any]) -> None:
         if self.model is None or self.scaler is None:
@@ -760,14 +752,6 @@ class TcnAnomalyPipeline:
             dt_std=float(max(dt_seconds.std(), EPSILON)),
             nominal_dt_seconds=float(np.median(positive_deltas)) if len(positive_deltas) > 0 else 0.0,
         )
-
-    def _summarize_window_values(self, window_values: np.ndarray) -> np.ndarray:
-        values = np.asarray(window_values, dtype=np.float32)
-        quarter = max(1, values.shape[1] // 4)
-        means = values.mean(axis=1)
-        stds = values.std(axis=1)
-        trend = values[:, -quarter:, :].mean(axis=1) - values[:, :quarter, :].mean(axis=1)
-        return np.concatenate([means, stds, trend], axis=1).astype(np.float32)
 
     def _transform_frame(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         assert self.scaler is not None
@@ -1213,9 +1197,14 @@ def prune_short_isolated_runs(
             if run_length < min_run_points:
                 support_start = max(0, run_start - support_padding)
                 support_stop = min(len(series), run_stop + support_padding)
-                support = values[support_start:support_stop].copy()
-                support[:, channel_index] = 0
-                if not support.any():
+                if not has_strong_channel_support(
+                    values=values,
+                    channel_index=channel_index,
+                    start=support_start,
+                    stop=support_stop,
+                    min_support_channels=2,
+                    min_support_points=6,
+                ):
                     series[run_start:run_stop] = 0
             run_start = None
         if run_start is not None:
@@ -1223,13 +1212,36 @@ def prune_short_isolated_runs(
             run_length = run_stop - run_start
             if run_length < min_run_points:
                 support_start = max(0, run_start - support_padding)
-                support = values[support_start:run_stop].copy()
-                support[:, channel_index] = 0
-                if not support.any():
+                if not has_strong_channel_support(
+                    values=values,
+                    channel_index=channel_index,
+                    start=support_start,
+                    stop=run_stop,
+                    min_support_channels=2,
+                    min_support_points=6,
+                ):
                     series[run_start:run_stop] = 0
         pruned[channel] = series
 
     return pruned
+
+
+def has_strong_channel_support(
+    values: np.ndarray,
+    channel_index: int,
+    start: int,
+    stop: int,
+    min_support_channels: int,
+    min_support_points: int,
+) -> bool:
+    support = values[start:stop].copy()
+    if support.size == 0:
+        return False
+    support[:, channel_index] = 0
+    channel_support_counts = support.sum(axis=0)
+    if int((channel_support_counts > 0).sum()) >= min_support_channels:
+        return True
+    return bool((channel_support_counts >= min_support_points).any())
 
 
 def merge_supported_close_runs(
@@ -1255,9 +1267,14 @@ def merge_supported_close_runs(
             if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
                 support_start = max(0, zero_start - support_padding)
                 support_stop = min(len(series), index + support_padding)
-                support = values[support_start:support_stop].copy()
-                support[:, channel_index] = 0
-                if support.any():
+                if has_strong_channel_support(
+                    values=values,
+                    channel_index=channel_index,
+                    start=support_start,
+                    stop=support_stop,
+                    min_support_channels=2,
+                    min_support_points=6,
+                ):
                     series[zero_start:index] = 1
             zero_start = None
         merged[channel] = series
