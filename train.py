@@ -205,6 +205,7 @@ class TcnTrainingConfig:
     reconstruction_loss_weight: float = 0.5
     forecast_score_weight: float = 1.0
     reconstruction_score_weight: float = 0.35
+    score_min_weight: float = 0.15
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
@@ -574,9 +575,10 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
-        combined = (
-            self.config.forecast_score_weight * forecast_scores
-            + self.config.reconstruction_score_weight * recon_scores
+        forecast_component = self.config.forecast_score_weight * forecast_scores
+        reconstruction_component = self.config.reconstruction_score_weight * recon_scores
+        combined = xp.maximum(forecast_component, reconstruction_component) + (
+            self.config.score_min_weight * xp.minimum(forecast_component, reconstruction_component)
         )
         covered = (forecast_count > 0) | (recon_count > 0)
 
@@ -1003,6 +1005,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_preload_dataset": True,
     "tcn_preload_max_gb": 8.0,
     "tcn_training_wall_seconds": 900.0,
+    "tcn_score_min_weight": 0.15,
 }
 
 DEFAULT_MEMORY_ARGS: dict[str, Any] = {
@@ -1085,6 +1088,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tcn-device", type=str, default=DEFAULT_TCN_ARGS["tcn_device"])
     parser.add_argument("--tcn-dataloader-workers", type=int, default=DEFAULT_TCN_ARGS["tcn_dataloader_workers"])
     parser.add_argument(
+        "--tcn-score-min-weight",
+        type=float,
+        default=DEFAULT_TCN_ARGS["tcn_score_min_weight"],
+        help="Fraction of the weaker score component retained after max-dominant fusion.",
+    )
+    parser.add_argument(
         "--tcn-preload-max-gb",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_preload_max_gb"],
@@ -1156,6 +1165,7 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         mask_ratio=resolved["tcn_mask_ratio"],
         train_stride=resolved["tcn_train_stride"],
         inference_stride=resolved["tcn_inference_stride"],
+        score_min_weight=resolved["tcn_score_min_weight"],
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
@@ -1197,14 +1207,9 @@ def prune_short_isolated_runs(
             if run_length < min_run_points:
                 support_start = max(0, run_start - support_padding)
                 support_stop = min(len(series), run_stop + support_padding)
-                if not has_strong_channel_support(
-                    values=values,
-                    channel_index=channel_index,
-                    start=support_start,
-                    stop=support_stop,
-                    min_support_channels=2,
-                    min_support_points=6,
-                ):
+                support = values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
                     series[run_start:run_stop] = 0
             run_start = None
         if run_start is not None:
@@ -1212,36 +1217,13 @@ def prune_short_isolated_runs(
             run_length = run_stop - run_start
             if run_length < min_run_points:
                 support_start = max(0, run_start - support_padding)
-                if not has_strong_channel_support(
-                    values=values,
-                    channel_index=channel_index,
-                    start=support_start,
-                    stop=run_stop,
-                    min_support_channels=2,
-                    min_support_points=6,
-                ):
+                support = values[support_start:run_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
                     series[run_start:run_stop] = 0
         pruned[channel] = series
 
     return pruned
-
-
-def has_strong_channel_support(
-    values: np.ndarray,
-    channel_index: int,
-    start: int,
-    stop: int,
-    min_support_channels: int,
-    min_support_points: int,
-) -> bool:
-    support = values[start:stop].copy()
-    if support.size == 0:
-        return False
-    support[:, channel_index] = 0
-    channel_support_counts = support.sum(axis=0)
-    if int((channel_support_counts > 0).sum()) >= min_support_channels:
-        return True
-    return bool((channel_support_counts >= min_support_points).any())
 
 
 def merge_supported_close_runs(
@@ -1267,14 +1249,9 @@ def merge_supported_close_runs(
             if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
                 support_start = max(0, zero_start - support_padding)
                 support_stop = min(len(series), index + support_padding)
-                if has_strong_channel_support(
-                    values=values,
-                    channel_index=channel_index,
-                    start=support_start,
-                    stop=support_stop,
-                    min_support_channels=2,
-                    min_support_points=6,
-                ):
+                support = values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if support.any():
                     series[zero_start:index] = 1
             zero_start = None
         merged[channel] = series
