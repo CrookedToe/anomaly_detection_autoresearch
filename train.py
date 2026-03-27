@@ -207,7 +207,6 @@ class TcnTrainingConfig:
     reconstruction_score_weight: float = 0.35
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
-    threshold_quantile_floor: float = 0.95
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
@@ -324,6 +323,8 @@ class TcnAnomalyPipeline:
         self.scaler: FeatureScaler | None = None
         self.model: SelfSupervisedTcnForecaster | None = None
         self.global_thresholds: np.ndarray | None = None
+        self.forecast_scale_thresholds: np.ndarray | None = None
+        self.reconstruction_scale_thresholds: np.ndarray | None = None
         self.use_amp = self.device.type == "cuda" and config.mixed_precision
         self.cp = self._try_load_cupy()
 
@@ -469,12 +470,12 @@ class TcnAnomalyPipeline:
         scores = np.where(covered, combined, 0.0).astype(np.float32)
         return pd.DataFrame(scores, index=frame.index, columns=self.target_channels)
 
-    def _aggregate_scores(
+    def _aggregate_component_scores(
         self,
         frame: pd.DataFrame,
         stride: int | None = None,
         window_starts: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before scoring.")
 
@@ -575,15 +576,26 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
-        combined = (
-            self.config.forecast_score_weight * forecast_scores
-            + self.config.reconstruction_score_weight * recon_scores
-        )
         covered = (forecast_count > 0) | (recon_count > 0)
 
         if self.cp is not None:
-            combined = self.cp.asnumpy(combined)
+            forecast_scores = self.cp.asnumpy(forecast_scores)
+            recon_scores = self.cp.asnumpy(recon_scores)
             covered = self.cp.asnumpy(covered)
+        return forecast_scores.astype(np.float32), recon_scores.astype(np.float32), covered.astype(bool)
+
+    def _aggregate_scores(
+        self,
+        frame: pd.DataFrame,
+        stride: int | None = None,
+        window_starts: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        forecast_scores, recon_scores, covered = self._aggregate_component_scores(
+            frame=frame,
+            stride=stride,
+            window_starts=window_starts,
+        )
+        combined = self._combine_component_scores(forecast_scores, recon_scores)
         return combined.astype(np.float32), covered.astype(bool)
 
     def predict(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -657,6 +669,12 @@ class TcnAnomalyPipeline:
                 "nominal_dt_seconds": self.scaler.nominal_dt_seconds,
             },
             "global_thresholds": None if self.global_thresholds is None else self.global_thresholds.tolist(),
+            "forecast_scale_thresholds": None
+            if self.forecast_scale_thresholds is None
+            else self.forecast_scale_thresholds.tolist(),
+            "reconstruction_scale_thresholds": None
+            if self.reconstruction_scale_thresholds is None
+            else self.reconstruction_scale_thresholds.tolist(),
             "metadata": metadata,
         }
         torch.save(payload, path)
@@ -839,15 +857,7 @@ class TcnAnomalyPipeline:
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
-            rolling_quantile = threshold_source.rolling(
-                self.config.threshold_window,
-                min_periods=max(16, self.config.threshold_window // 8),
-            ).quantile(self.config.threshold_quantile_floor)
-            threshold = np.maximum(
-                dynamic_threshold.fillna(global_thresholds[channel_index]),
-                rolling_quantile.fillna(global_thresholds[channel_index]),
-            )
-            threshold = np.maximum(threshold, global_thresholds[channel_index])
+            threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
             raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
@@ -888,11 +898,14 @@ class TcnAnomalyPipeline:
         return processed
 
     def _calibrate_thresholds(self, train_df: pd.DataFrame, train_starts: np.ndarray) -> np.ndarray:
-        combined, covered = self._aggregate_scores(
+        forecast_scores, recon_scores, covered = self._aggregate_component_scores(
             frame=train_df,
             stride=self.config.train_stride,
             window_starts=train_starts,
         )
+        self.forecast_scale_thresholds = self._calibrate_component_scales(forecast_scores, covered)
+        self.reconstruction_scale_thresholds = self._calibrate_component_scales(recon_scores, covered)
+        combined = self._combine_component_scores(forecast_scores, recon_scores)
         thresholds = np.zeros(len(self.target_channels), dtype=np.float32)
         for channel_index in range(len(self.target_channels)):
             valid_scores = combined[covered[:, channel_index], channel_index]
@@ -901,6 +914,41 @@ class TcnAnomalyPipeline:
                 continue
             thresholds[channel_index] = float(np.quantile(valid_scores, self.config.calibration_quantile))
         return thresholds
+
+    def _calibrate_component_scales(self, scores: np.ndarray, covered: np.ndarray) -> np.ndarray:
+        scales = np.ones(len(self.target_channels), dtype=np.float32)
+        for channel_index in range(len(self.target_channels)):
+            valid_scores = scores[covered[:, channel_index], channel_index]
+            if len(valid_scores) == 0:
+                continue
+            scales[channel_index] = max(
+                float(np.quantile(valid_scores, self.config.calibration_quantile)),
+                EPSILON,
+            )
+        return scales
+
+    def _combine_component_scores(
+        self,
+        forecast_scores: np.ndarray,
+        recon_scores: np.ndarray,
+    ) -> np.ndarray:
+        forecast_scale = self.forecast_scale_thresholds
+        if forecast_scale is None:
+            forecast_scale = np.ones(len(self.target_channels), dtype=np.float32)
+        recon_scale = self.reconstruction_scale_thresholds
+        if recon_scale is None:
+            recon_scale = np.ones(len(self.target_channels), dtype=np.float32)
+
+        forecast_norm = forecast_scores / np.maximum(forecast_scale.reshape(1, -1), EPSILON)
+        recon_norm = recon_scores / np.maximum(recon_scale.reshape(1, -1), EPSILON)
+
+        weight_sum = max(self.config.forecast_score_weight + self.config.reconstruction_score_weight, EPSILON)
+        balanced = (
+            self.config.forecast_score_weight * forecast_norm
+            + self.config.reconstruction_score_weight * recon_norm
+        ) / weight_sum
+        peak_sensitive = np.maximum(forecast_norm, recon_norm)
+        return (0.7 * balanced + 0.3 * peak_sensitive).astype(np.float32)
 
     def _pad_or_trim_window(self, window: pd.DataFrame) -> pd.DataFrame:
         target_window = window.copy()
@@ -1003,7 +1051,6 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
-    "tcn_threshold_quantile_floor": 0.95,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
@@ -1071,11 +1118,6 @@ def parse_args() -> argparse.Namespace:
         "--tcn-threshold-std-factor",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_threshold_std_factor"],
-    )
-    parser.add_argument(
-        "--tcn-threshold-quantile-floor",
-        type=float,
-        default=DEFAULT_TCN_ARGS["tcn_threshold_quantile_floor"],
     )
     parser.add_argument(
         "--tcn-calibration-quantile",
@@ -1173,7 +1215,6 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         inference_stride=resolved["tcn_inference_stride"],
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
-        threshold_quantile_floor=resolved["tcn_threshold_quantile_floor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
