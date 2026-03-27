@@ -1168,19 +1168,13 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
 
 
 def prune_short_isolated_runs(
-    scores: pd.DataFrame,
     predictions: pd.DataFrame,
     target_channels: list[str],
     min_run_points: int,
     support_padding: int,
-    global_thresholds: np.ndarray | None,
-    strong_score_scale: float,
 ) -> pd.DataFrame:
     pruned = predictions.copy()
     values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    threshold_lookup = None
-    if global_thresholds is not None:
-        threshold_lookup = {channel: float(global_thresholds[index]) for index, channel in enumerate(target_channels)}
 
     for channel_index, channel in enumerate(target_channels):
         series = values[:, channel_index].copy()
@@ -1196,29 +1190,58 @@ def prune_short_isolated_runs(
             run_stop = index
             run_length = run_stop - run_start
             if run_length < min_run_points:
-                peak_score = float(scores[channel].iloc[run_start:run_stop].max())
                 support_start = max(0, run_start - support_padding)
                 support_stop = min(len(series), run_stop + support_padding)
                 support = values[support_start:support_stop].copy()
                 support[:, channel_index] = 0
-                strong_enough = threshold_lookup is not None and peak_score >= (threshold_lookup[channel] * strong_score_scale)
-                if not support.any() and not strong_enough:
+                if not support.any():
                     series[run_start:run_stop] = 0
             run_start = None
         if run_start is not None:
             run_stop = len(series)
             run_length = run_stop - run_start
             if run_length < min_run_points:
-                peak_score = float(scores[channel].iloc[run_start:run_stop].max())
                 support_start = max(0, run_start - support_padding)
                 support = values[support_start:run_stop].copy()
                 support[:, channel_index] = 0
-                strong_enough = threshold_lookup is not None and peak_score >= (threshold_lookup[channel] * strong_score_scale)
-                if not support.any() and not strong_enough:
+                if not support.any():
                     series[run_start:run_stop] = 0
         pruned[channel] = series
 
     return pruned
+
+
+def merge_supported_close_runs(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    max_gap_points: int,
+    support_padding: int,
+) -> pd.DataFrame:
+    merged = predictions.copy()
+    values = merged[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = values[:, channel_index].copy()
+        zero_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 0:
+                if zero_start is None:
+                    zero_start = index
+                continue
+            if zero_start is None:
+                continue
+            gap_length = index - zero_start
+            if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
+                support_start = max(0, zero_start - support_padding)
+                support_stop = min(len(series), index + support_padding)
+                support = values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if support.any():
+                    series[zero_start:index] = 1
+            zero_start = None
+        merged[channel] = series
+
+    return merged
 
 
 def apply_same_channel_memory_gating(
@@ -1280,13 +1303,16 @@ def run_tcn_split(
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
     baseline_predictions = prune_short_isolated_runs(
-        scores=baseline_scores,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
         min_run_points=20,
         support_padding=8,
-        global_thresholds=pipeline.global_thresholds,
-        strong_score_scale=1.5,
+    )
+    baseline_predictions = merge_supported_close_runs(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        max_gap_points=8,
+        support_padding=8,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
