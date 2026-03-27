@@ -1185,10 +1185,14 @@ def apply_same_channel_memory_gating(
         if not channel_prototypes:
             continue
         channel_bank = RareNominalMemoryBank(channel_prototypes)
+        channel_predictions = predictions.copy()
+        for other_channel in target_channels:
+            if other_channel != channel:
+                channel_predictions[other_channel] = 0
         channel_gated, channel_suppressed = apply_memory_gating(
             frame=frame,
-            predictions=predictions[[channel]],
-            target_channels=[channel],
+            predictions=channel_predictions,
+            target_channels=target_channels,
             memory_bank=channel_bank,
             half_window=half_window,
             metric=metric,
