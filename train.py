@@ -186,14 +186,6 @@ class FeatureScaler:
 
 
 @dataclass
-class ScoreNormalizer:
-    forecast_median: np.ndarray
-    forecast_scale: np.ndarray
-    reconstruction_median: np.ndarray
-    reconstruction_scale: np.ndarray
-
-
-@dataclass
 class TcnTrainingConfig:
     sequence_length: int = 128
     horizon: int = 8
@@ -331,7 +323,6 @@ class TcnAnomalyPipeline:
         self.scaler: FeatureScaler | None = None
         self.model: SelfSupervisedTcnForecaster | None = None
         self.global_thresholds: np.ndarray | None = None
-        self.score_normalizer: ScoreNormalizer | None = None
         self.use_amp = self.device.type == "cuda" and config.mixed_precision
         self.cp = self._try_load_cupy()
 
@@ -455,17 +446,7 @@ class TcnAnomalyPipeline:
         if best_state is not None:
             self.model.load_state_dict(best_state)
 
-        forecast_scores, reconstruction_scores, covered = self._aggregate_score_components(
-            frame=train_df,
-            stride=self.config.train_stride,
-            window_starts=train_starts,
-        )
-        self.score_normalizer = self._fit_score_normalizer(forecast_scores, reconstruction_scores, covered)
-        self.global_thresholds = self._calibrate_thresholds(
-            forecast_scores=forecast_scores,
-            reconstruction_scores=reconstruction_scores,
-            covered=covered,
-        )
+        self.global_thresholds = self._calibrate_thresholds(train_df, train_starts)
 
         return {
             "device": str(self.device),
@@ -479,12 +460,6 @@ class TcnAnomalyPipeline:
             "num_train_windows": int(len(train_starts)),
             "num_val_windows": int(len(val_starts)),
             "history": history,
-            "score_normalizer": {
-                "forecast_median": self.score_normalizer.forecast_median.tolist(),
-                "forecast_scale": self.score_normalizer.forecast_scale.tolist(),
-                "reconstruction_median": self.score_normalizer.reconstruction_median.tolist(),
-                "reconstruction_scale": self.score_normalizer.reconstruction_scale.tolist(),
-            },
             "global_thresholds": self.global_thresholds.tolist(),
         }
 
@@ -499,20 +474,6 @@ class TcnAnomalyPipeline:
         stride: int | None = None,
         window_starts: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        forecast_scores, reconstruction_scores, covered = self._aggregate_score_components(
-            frame=frame,
-            stride=stride,
-            window_starts=window_starts,
-        )
-        combined = self._combine_scores(forecast_scores, reconstruction_scores)
-        return combined.astype(np.float32), covered.astype(bool)
-
-    def _aggregate_score_components(
-        self,
-        frame: pd.DataFrame,
-        stride: int | None = None,
-        window_starts: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before scoring.")
 
@@ -613,13 +574,16 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
+        combined = (
+            self.config.forecast_score_weight * forecast_scores
+            + self.config.reconstruction_score_weight * recon_scores
+        )
         covered = (forecast_count > 0) | (recon_count > 0)
 
         if self.cp is not None:
-            forecast_scores = self.cp.asnumpy(forecast_scores)
-            recon_scores = self.cp.asnumpy(recon_scores)
+            combined = self.cp.asnumpy(combined)
             covered = self.cp.asnumpy(covered)
-        return forecast_scores.astype(np.float32), recon_scores.astype(np.float32), covered.astype(bool)
+        return combined.astype(np.float32), covered.astype(bool)
 
     def predict(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         scores = self.score_sequence(frame)
@@ -914,80 +878,12 @@ class TcnAnomalyPipeline:
 
         return processed
 
-    def _fit_score_normalizer(
-        self,
-        forecast_scores: np.ndarray,
-        reconstruction_scores: np.ndarray,
-        covered: np.ndarray,
-    ) -> ScoreNormalizer:
-        forecast_median = np.zeros(len(self.target_channels), dtype=np.float32)
-        forecast_scale = np.ones(len(self.target_channels), dtype=np.float32)
-        reconstruction_median = np.zeros(len(self.target_channels), dtype=np.float32)
-        reconstruction_scale = np.ones(len(self.target_channels), dtype=np.float32)
-
-        for channel_index in range(len(self.target_channels)):
-            valid_mask = covered[:, channel_index]
-            if not valid_mask.any():
-                continue
-
-            forecast_valid = forecast_scores[valid_mask, channel_index]
-            reconstruction_valid = reconstruction_scores[valid_mask, channel_index]
-
-            forecast_mid = float(np.median(forecast_valid))
-            forecast_mad = float(np.median(np.abs(forecast_valid - forecast_mid)))
-            reconstruction_mid = float(np.median(reconstruction_valid))
-            reconstruction_mad = float(np.median(np.abs(reconstruction_valid - reconstruction_mid)))
-
-            forecast_median[channel_index] = forecast_mid
-            forecast_scale[channel_index] = max(1.4826 * forecast_mad, EPSILON)
-            reconstruction_median[channel_index] = reconstruction_mid
-            reconstruction_scale[channel_index] = max(1.4826 * reconstruction_mad, EPSILON)
-
-        return ScoreNormalizer(
-            forecast_median=forecast_median,
-            forecast_scale=forecast_scale,
-            reconstruction_median=reconstruction_median,
-            reconstruction_scale=reconstruction_scale,
+    def _calibrate_thresholds(self, train_df: pd.DataFrame, train_starts: np.ndarray) -> np.ndarray:
+        combined, covered = self._aggregate_scores(
+            frame=train_df,
+            stride=self.config.train_stride,
+            window_starts=train_starts,
         )
-
-    def _normalize_score_component(
-        self,
-        scores: np.ndarray,
-        median: np.ndarray,
-        scale: np.ndarray,
-    ) -> np.ndarray:
-        centered = scores - median.reshape(1, -1)
-        return np.maximum(centered, 0.0) / scale.reshape(1, -1)
-
-    def _combine_scores(self, forecast_scores: np.ndarray, reconstruction_scores: np.ndarray) -> np.ndarray:
-        if self.score_normalizer is None:
-            return (
-                self.config.forecast_score_weight * forecast_scores
-                + self.config.reconstruction_score_weight * reconstruction_scores
-            )
-
-        normalized_forecast = self._normalize_score_component(
-            forecast_scores,
-            self.score_normalizer.forecast_median,
-            self.score_normalizer.forecast_scale,
-        )
-        normalized_reconstruction = self._normalize_score_component(
-            reconstruction_scores,
-            self.score_normalizer.reconstruction_median,
-            self.score_normalizer.reconstruction_scale,
-        )
-        return (
-            self.config.forecast_score_weight * normalized_forecast
-            + self.config.reconstruction_score_weight * normalized_reconstruction
-        )
-
-    def _calibrate_thresholds(
-        self,
-        forecast_scores: np.ndarray,
-        reconstruction_scores: np.ndarray,
-        covered: np.ndarray,
-    ) -> np.ndarray:
-        combined = self._combine_scores(forecast_scores, reconstruction_scores)
         thresholds = np.zeros(len(self.target_channels), dtype=np.float32)
         for channel_index in range(len(self.target_channels)):
             valid_scores = combined[covered[:, channel_index], channel_index]
@@ -1353,6 +1249,53 @@ def merge_supported_close_runs(
     return merged
 
 
+def split_runs_by_cross_channel_support(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    support_padding: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    supported = predictions.copy()
+    unsupported = predictions.copy()
+    supported.loc[:, target_channels] = 0
+    unsupported.loc[:, target_channels] = 0
+    values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    supported_values = supported[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    unsupported_values = unsupported[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = values[:, channel_index]
+        run_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 1 and run_start is None:
+                run_start = index
+                continue
+            if value == 1:
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            target = supported_values if support.any() else unsupported_values
+            target[run_start:run_stop, channel_index] = 1
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            support_start = max(0, run_start - support_padding)
+            support = values[support_start:run_stop].copy()
+            support[:, channel_index] = 0
+            target = supported_values if support.any() else unsupported_values
+            target[run_start:run_stop, channel_index] = 1
+
+        supported[channel] = supported_values[:, channel_index]
+        unsupported[channel] = unsupported_values[:, channel_index]
+
+    return supported, unsupported
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1439,10 +1382,26 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
-    log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
-        frame=test_df,
+    supported_predictions, unsupported_predictions = split_runs_by_cross_channel_support(
         predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        support_padding=8,
+    )
+    log_debug(f"[tcn] applying memory gating for '{split}'")
+    supported_threshold = min(0.995, resolved_args["memory_threshold"] + 0.04)
+    gated_supported_predictions, supported_suppressed_events = apply_same_channel_memory_gating(
+        frame=test_df,
+        predictions=supported_predictions,
+        target_channels=args.target_channels,
+        memory_bank=memory_bank,
+        half_window=resolved_args["half_window"],
+        metric=args.metric,
+        threshold=supported_threshold,
+        vectorizer=pipeline.vectorize_windows,
+    )
+    gated_unsupported_predictions, unsupported_suppressed_events = apply_same_channel_memory_gating(
+        frame=test_df,
+        predictions=unsupported_predictions,
         target_channels=args.target_channels,
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
@@ -1450,6 +1409,17 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
+    gated_predictions = baseline_predictions.copy()
+    gated_predictions.loc[:, args.target_channels] = np.maximum(
+        gated_supported_predictions[args.target_channels].to_numpy(dtype=np.uint8, copy=False),
+        gated_unsupported_predictions[args.target_channels].to_numpy(dtype=np.uint8, copy=False),
+    )
+    if not supported_suppressed_events.empty and not unsupported_suppressed_events.empty:
+        suppressed_events = pd.concat([supported_suppressed_events, unsupported_suppressed_events], ignore_index=True)
+    elif not supported_suppressed_events.empty:
+        suppressed_events = supported_suppressed_events
+    else:
+        suppressed_events = unsupported_suppressed_events
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
@@ -1480,6 +1450,7 @@ def run_tcn_split(
             "half_window": resolved_args["half_window"],
             "metric": args.metric,
             "memory_threshold": resolved_args["memory_threshold"],
+            "supported_memory_threshold": supported_threshold,
             "memory_size": len(memory_bank.prototypes),
             "config": asdict(tcn_config),
             "preset": args.tcn_preset,
