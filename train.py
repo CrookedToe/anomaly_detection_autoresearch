@@ -23,7 +23,6 @@ from torch.utils.data import DataLoader, Dataset
 
 from prepare import (
     DEFAULT_TARGET_CHANNELS,
-    extract_centered_window,
     PRIMARY_METRIC_DIRECTION,
     PRIMARY_METRIC_KEY,
     READING_MATERIALS_DIR,
@@ -31,7 +30,6 @@ from prepare import (
     compute_esa_metrics,
     load_split_data,
     log_debug,
-    MemoryPrototype,
     reading_materials_snapshot,
     RareNominalMemoryBank,
     run_std_split,
@@ -1476,62 +1474,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def build_temporal_rare_event_memory_bank(
-    frame: pd.DataFrame,
-    labels: pd.DataFrame,
-    target_channels: list[str],
-    half_window: int,
-    vectorizer: Any | None = None,
-    prototype_positions: tuple[float, ...] = (0.2, 0.5, 0.8),
-) -> RareNominalMemoryBank:
-    rare_events = (
-        labels.loc[labels["Category"] == "Rare Event", ["ID", "Channel", "StartTime", "EndTime"]]
-        .drop_duplicates()
-        .sort_values(["StartTime", "Channel"])
-    )
-
-    prototype_rows: list[tuple[Any, pd.Timestamp, str]] = []
-    windows: list[pd.DataFrame] = []
-
-    for row in rare_events.itertuples(index=False):
-        if row.Channel not in target_channels:
-            continue
-
-        start_time = pd.Timestamp(row.StartTime)
-        end_time = pd.Timestamp(row.EndTime)
-        duration = end_time - start_time
-        seen_centers: set[pd.Timestamp] = set()
-
-        for position in prototype_positions:
-            center_time = start_time + (duration * float(position))
-            center_time = pd.Timestamp(center_time)
-            if center_time in seen_centers:
-                continue
-            seen_centers.add(center_time)
-            prototype_rows.append((row, center_time, f"p{int(round(position * 100)):02d}"))
-            windows.append(extract_centered_window(frame, center_time, target_channels, half_window))
-
-    if vectorizer is not None:
-        vectors = vectorizer(windows)
-    else:
-        vectors = np.asarray([window.to_numpy(dtype=np.float32).reshape(-1) for window in windows], dtype=np.float32)
-
-    prototypes: list[MemoryPrototype] = []
-    for (row, center_time, suffix), vector in zip(prototype_rows, vectors):
-        prototypes.append(
-            MemoryPrototype(
-                prototype_id=f"{row.ID}:{row.Channel}:{suffix}",
-                event_id=str(row.ID),
-                channel=str(row.Channel),
-                start_time=center_time.isoformat(),
-                end_time=center_time.isoformat(),
-                vector=np.asarray(vector, dtype=np.float32),
-            )
-        )
-
-    return RareNominalMemoryBank(prototypes)
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1596,7 +1538,7 @@ def run_tcn_split(
     write_json(baseline_dir / "training.json", training_summary)
 
     log_debug(f"[tcn] building memory bank for '{split}'")
-    memory_bank = build_temporal_rare_event_memory_bank(
+    memory_bank = RareNominalMemoryBank.from_labeled_rare_events(
         frame=train_df,
         labels=train_labels,
         target_channels=args.target_channels,
