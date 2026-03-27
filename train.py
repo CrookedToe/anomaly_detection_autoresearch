@@ -26,8 +26,8 @@ from prepare import (
     PRIMARY_METRIC_DIRECTION,
     PRIMARY_METRIC_KEY,
     READING_MATERIALS_DIR,
-    apply_memory_gating,
     compute_esa_metrics,
+    extract_centered_windows_array,
     load_split_data,
     log_debug,
     reading_materials_snapshot,
@@ -36,6 +36,7 @@ from prepare import (
     save_detector_results,
     summarize_detector_run,
     summarize_suppressions,
+    windows_to_vectors,
     write_json,
 )
 
@@ -1463,85 +1464,10 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def split_weak_isolated_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    support_padding: int,
-    max_run_points: int,
-    max_peak_ratio: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    strict_subset = predictions.copy()
-    strict_subset[target_channels] = 0
-    remainder = predictions.copy()
-    prediction_values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    strict_values = strict_subset[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    remainder_values = remainder[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index]
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
-
-            run_length = run_stop - run_start
-            if run_length > max_run_points:
-                continue
-
-            segment = channel_scores[run_start:run_stop]
-            if len(segment) == 0 or (float(segment.max()) / threshold) > max_peak_ratio:
-                continue
-
-            support_start = max(0, run_start - support_padding)
-            support_stop = min(len(series), run_stop + support_padding)
-            support = prediction_values[support_start:support_stop].copy()
-            support[:, channel_index] = 0
-            if support.any():
-                continue
-
-            strict_values[run_start:run_stop, channel_index] = 1
-            remainder_values[run_start:run_stop, channel_index] = 0
-
-    strict_subset[target_channels] = strict_values
-    remainder[target_channels] = remainder_values
-    return strict_subset, remainder
-
-
-def combine_prediction_frames(predictions: list[pd.DataFrame], target_channels: list[str]) -> pd.DataFrame:
-    combined = predictions[0].copy()
-    combined[target_channels] = 0
-    combined_values = combined[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for frame in predictions:
-        combined_values = np.maximum(combined_values, frame[target_channels].to_numpy(dtype=np.uint8, copy=False))
-
-    combined[target_channels] = combined_values
-    return combined
-
-
-def concat_suppressed_events(*frames: pd.DataFrame) -> pd.DataFrame:
-    usable = [frame for frame in frames if not frame.empty]
-    if not usable:
-        return pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
-    return pd.concat(usable, ignore_index=True)
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
+    scores: pd.DataFrame,
     target_channels: list[str],
     memory_bank: RareNominalMemoryBank,
     half_window: int,
@@ -1550,84 +1476,74 @@ def apply_same_channel_memory_gating(
     vectorizer: Any | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
-    suppressed_frames: list[pd.DataFrame] = []
+    suppressed_events: list[dict[str, Any]] = []
+    indexed_frame = frame.copy()
+    if "timestamp" in indexed_frame.columns:
+        indexed_frame["timestamp"] = pd.to_datetime(indexed_frame["timestamp"])
+        indexed_frame = indexed_frame.set_index("timestamp")
 
     for channel in target_channels:
         channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
         if not channel_prototypes:
             continue
         channel_bank = RareNominalMemoryBank(channel_prototypes)
-        channel_predictions = predictions.copy()
-        for other_channel in target_channels:
-            if other_channel != channel:
-                channel_predictions[other_channel] = 0
-        channel_gated, channel_suppressed = apply_memory_gating(
-            frame=frame,
-            predictions=channel_predictions,
-            target_channels=target_channels,
-            memory_bank=channel_bank,
-            half_window=half_window,
-            metric=metric,
-            threshold=threshold,
-            vectorizer=vectorizer,
-        )
-        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
-        if not channel_suppressed.empty:
-            suppressed_frames.append(channel_suppressed)
+        series = predictions[channel].astype(np.uint8)
+        channel_scores = scores[channel].astype(np.float32)
+        candidate_events: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
+        run_start: pd.Timestamp | None = None
+        previous_timestamp: pd.Timestamp | None = None
 
-    if suppressed_frames:
-        suppressed_events = pd.concat(suppressed_frames, ignore_index=True)
-    else:
-        suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
-    return gated_predictions, suppressed_events
+        for timestamp, value in series.items():
+            current_timestamp = pd.Timestamp(timestamp)
+            if int(value) == 1 and run_start is None:
+                run_start = current_timestamp
+            elif int(value) == 0 and run_start is not None and previous_timestamp is not None:
+                run_scores = channel_scores.loc[run_start:previous_timestamp]
+                peak_time = pd.Timestamp(run_scores.idxmax()) if not run_scores.empty else run_start
+                candidate_events.append((run_start, previous_timestamp, peak_time))
+                run_start = None
+            previous_timestamp = current_timestamp
 
+        if run_start is not None and previous_timestamp is not None:
+            run_scores = channel_scores.loc[run_start:previous_timestamp]
+            peak_time = pd.Timestamp(run_scores.idxmax()) if not run_scores.empty else run_start
+            candidate_events.append((run_start, previous_timestamp, peak_time))
 
-def apply_selective_same_channel_memory_gating(
-    frame: pd.DataFrame,
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    memory_bank: RareNominalMemoryBank,
-    half_window: int,
-    metric: str,
-    default_threshold: float,
-    strict_short_threshold: float,
-    global_thresholds: np.ndarray,
-    vectorizer: Any | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    strict_predictions, default_predictions = split_weak_isolated_runs(
-        predictions=predictions,
-        scores=scores,
-        target_channels=target_channels,
-        global_thresholds=global_thresholds,
-        support_padding=8,
-        max_run_points=12,
-        max_peak_ratio=1.35,
+        if not candidate_events:
+            continue
+
+        log_debug(f"[memory] peak-centered gating channel={channel} candidates={len(candidate_events)}")
+        chunk_size = 2048
+        for chunk_start in range(0, len(candidate_events), chunk_size):
+            chunk_events = candidate_events[chunk_start : chunk_start + chunk_size]
+            query_times = [peak_time for _, _, peak_time in chunk_events]
+            chunk_windows = extract_centered_windows_array(indexed_frame, query_times, target_channels, half_window)
+            if vectorizer is not None:
+                query_vectors = vectorizer(chunk_windows)
+            else:
+                query_vectors = windows_to_vectors(chunk_windows)
+            matches = channel_bank.query_many(query_vectors=query_vectors, metric=metric, threshold=threshold)
+
+            for (start_time, end_time, _), match in zip(chunk_events, matches):
+                if match is None:
+                    continue
+                gated_predictions.loc[start_time:end_time, channel] = 0
+                suppressed_events.append(
+                    {
+                        "channel": channel,
+                        "start_time": start_time.isoformat(),
+                        "end_time": end_time.isoformat(),
+                        "prototype_id": match.prototype.prototype_id,
+                        "score": match.score,
+                        "metric": metric,
+                    }
+                )
+
+    suppressed_frame = pd.DataFrame(
+        suppressed_events,
+        columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"],
     )
-    default_gated, default_suppressed = apply_same_channel_memory_gating(
-        frame=frame,
-        predictions=default_predictions,
-        target_channels=target_channels,
-        memory_bank=memory_bank,
-        half_window=half_window,
-        metric=metric,
-        threshold=default_threshold,
-        vectorizer=vectorizer,
-    )
-    strict_gated, strict_suppressed = apply_same_channel_memory_gating(
-        frame=frame,
-        predictions=strict_predictions,
-        target_channels=target_channels,
-        memory_bank=memory_bank,
-        half_window=half_window,
-        metric=metric,
-        threshold=strict_short_threshold,
-        vectorizer=vectorizer,
-    )
-    return combine_prediction_frames([default_gated, strict_gated], target_channels), concat_suppressed_events(
-        default_suppressed,
-        strict_suppressed,
-    )
+    return gated_predictions, suppressed_frame
 
 
 def run_tcn_split(
@@ -1708,7 +1624,7 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_selective_same_channel_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1716,9 +1632,7 @@ def run_tcn_split(
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
         metric=args.metric,
-        default_threshold=resolved_args["memory_threshold"],
-        strict_short_threshold=max(0.88, resolved_args["memory_threshold"] - 0.02),
-        global_thresholds=pipeline.global_thresholds,
+        threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
 
