@@ -1168,13 +1168,19 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
 
 
 def prune_short_isolated_runs(
+    scores: pd.DataFrame,
     predictions: pd.DataFrame,
     target_channels: list[str],
     min_run_points: int,
     support_padding: int,
+    global_thresholds: np.ndarray | None,
+    strong_score_scale: float,
 ) -> pd.DataFrame:
     pruned = predictions.copy()
     values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    threshold_lookup = None
+    if global_thresholds is not None:
+        threshold_lookup = {channel: float(global_thresholds[index]) for index, channel in enumerate(target_channels)}
 
     for channel_index, channel in enumerate(target_channels):
         series = values[:, channel_index].copy()
@@ -1190,21 +1196,25 @@ def prune_short_isolated_runs(
             run_stop = index
             run_length = run_stop - run_start
             if run_length < min_run_points:
+                peak_score = float(scores[channel].iloc[run_start:run_stop].max())
                 support_start = max(0, run_start - support_padding)
                 support_stop = min(len(series), run_stop + support_padding)
                 support = values[support_start:support_stop].copy()
                 support[:, channel_index] = 0
-                if not support.any():
+                strong_enough = threshold_lookup is not None and peak_score >= (threshold_lookup[channel] * strong_score_scale)
+                if not support.any() and not strong_enough:
                     series[run_start:run_stop] = 0
             run_start = None
         if run_start is not None:
             run_stop = len(series)
             run_length = run_stop - run_start
             if run_length < min_run_points:
+                peak_score = float(scores[channel].iloc[run_start:run_stop].max())
                 support_start = max(0, run_start - support_padding)
                 support = values[support_start:run_stop].copy()
                 support[:, channel_index] = 0
-                if not support.any():
+                strong_enough = threshold_lookup is not None and peak_score >= (threshold_lookup[channel] * strong_score_scale)
+                if not support.any() and not strong_enough:
                     series[run_start:run_stop] = 0
         pruned[channel] = series
 
@@ -1254,35 +1264,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_long_suppressed_runs(
-    baseline_predictions: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    min_run_points: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
-
-    restored = gated_predictions.copy()
-    kept_suppressions: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict("records"):
-        channel = str(row["channel"])
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        run_length = int(baseline_predictions.loc[start_time:end_time, channel].sum())
-        if run_length >= min_run_points:
-            restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
-            continue
-        kept_suppressions.append(row)
-
-    if kept_suppressions:
-        filtered_suppressions = pd.DataFrame(kept_suppressions)
-    else:
-        filtered_suppressions = pd.DataFrame(columns=suppressed_events.columns)
-    return restored, filtered_suppressions
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1299,10 +1280,13 @@ def run_tcn_split(
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
     baseline_predictions = prune_short_isolated_runs(
+        scores=baseline_scores,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
         min_run_points=20,
         support_padding=8,
+        global_thresholds=pipeline.global_thresholds,
+        strong_score_scale=1.5,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
@@ -1330,12 +1314,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_long_suppressed_runs(
-        baseline_predictions=baseline_predictions,
-        gated_predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        min_run_points=20,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
