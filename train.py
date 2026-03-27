@@ -49,7 +49,7 @@ class TcnModelConfig:
     embedding_dim: int = 64
     kernel_size: int = 3
     num_blocks: int = 5
-    dropout: float = 0.1
+    dropout: float = 0.05
     use_depthwise_separable: bool = True
 
 
@@ -193,7 +193,7 @@ class TcnTrainingConfig:
     embedding_dim: int = 64
     num_blocks: int = 5
     kernel_size: int = 3
-    dropout: float = 0.1
+    dropout: float = 0.05
     batch_size: int = 512
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
@@ -979,7 +979,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_embedding_dim": 64,
     "tcn_num_blocks": 5,
     "tcn_kernel_size": 3,
-    "tcn_dropout": 0.1,
+    "tcn_dropout": 0.05,
     "tcn_batch_size": 2048,
     "tcn_learning_rate": 1e-3,
     "tcn_weight_decay": 1e-4,
