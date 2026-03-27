@@ -1177,12 +1177,20 @@ def prune_short_isolated_runs(
     target_channels: list[str],
     min_run_points: int,
     support_padding: int,
+    scores: pd.DataFrame | None = None,
+    global_thresholds: np.ndarray | None = None,
+    strong_peak_ratio: float = 1.0,
+    strong_mean_ratio: float = 1.0,
 ) -> pd.DataFrame:
     pruned = predictions.copy()
     values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = None if scores is None else scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = None if global_thresholds is None else np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
         series = values[:, channel_index].copy()
+        channel_scores = None if score_values is None else score_values[:, channel_index]
+        threshold = None if thresholds is None else max(float(thresholds[channel_index]), EPSILON)
         run_start: int | None = None
         for index, value in enumerate(series):
             if value == 1 and run_start is None:
@@ -1195,6 +1203,14 @@ def prune_short_isolated_runs(
             run_stop = index
             run_length = run_stop - run_start
             if run_length < min_run_points:
+                if channel_scores is not None and threshold is not None:
+                    segment = channel_scores[run_start:run_stop]
+                    if len(segment) > 0:
+                        peak_score = float(segment.max())
+                        mean_score = float(segment.mean())
+                        if peak_score >= (threshold * strong_peak_ratio) and mean_score >= (threshold * strong_mean_ratio):
+                            run_start = None
+                            continue
                 support_start = max(0, run_start - support_padding)
                 support_stop = min(len(series), run_stop + support_padding)
                 support = values[support_start:support_stop].copy()
@@ -1206,6 +1222,14 @@ def prune_short_isolated_runs(
             run_stop = len(series)
             run_length = run_stop - run_start
             if run_length < min_run_points:
+                if channel_scores is not None and threshold is not None:
+                    segment = channel_scores[run_start:run_stop]
+                    if len(segment) > 0:
+                        peak_score = float(segment.max())
+                        mean_score = float(segment.mean())
+                        if peak_score >= (threshold * strong_peak_ratio) and mean_score >= (threshold * strong_mean_ratio):
+                            pruned[channel] = series
+                            continue
                 support_start = max(0, run_start - support_padding)
                 support = values[support_start:run_stop].copy()
                 support[:, channel_index] = 0
@@ -1430,6 +1454,10 @@ def run_tcn_split(
         target_channels=args.target_channels,
         min_run_points=20,
         support_padding=8,
+        scores=baseline_scores,
+        global_thresholds=pipeline.global_thresholds,
+        strong_peak_ratio=1.35,
+        strong_mean_ratio=1.0,
     )
     baseline_predictions = merge_supported_close_runs(
         predictions=baseline_predictions,
