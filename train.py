@@ -816,6 +816,9 @@ class TcnAnomalyPipeline:
     def _dynamic_threshold(self, scores: pd.DataFrame) -> pd.DataFrame:
         thresholded = pd.DataFrame(index=scores.index)
         global_thresholds = self.global_thresholds if self.global_thresholds is not None else np.zeros(len(self.target_channels))
+        raw_predictions: dict[str, np.ndarray] = {}
+        smoothed_cache: dict[str, np.ndarray] = {}
+        threshold_cache: dict[str, np.ndarray] = {}
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
@@ -839,22 +842,30 @@ class TcnAnomalyPipeline:
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            continue_threshold = np.maximum(threshold * 0.9, global_thresholds[channel_index])
-            raw_prediction = np.zeros(len(smoothed_series), dtype=np.uint8)
-            active = False
-            for index, score in enumerate(smoothed_series.to_numpy(dtype=np.float32, copy=False)):
-                start_threshold = float(threshold.iloc[index])
-                if not active:
-                    if score > start_threshold:
-                        raw_prediction[index] = 1
-                        active = True
-                    continue
-                sustain_threshold = float(continue_threshold.iloc[index])
-                if score > sustain_threshold:
-                    raw_prediction[index] = 1
-                    continue
-                active = False
-            thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
+            smoothed_values = smoothed_series.to_numpy(dtype=np.float32, copy=True)
+            threshold_values = threshold.to_numpy(dtype=np.float32, copy=True)
+            raw_predictions[channel] = (smoothed_values > threshold_values).astype(np.uint8, copy=False)
+            smoothed_cache[channel] = smoothed_values
+            threshold_cache[channel] = threshold_values
+
+        if len(self.target_channels) > 1:
+            support_window = 8
+            near_threshold_ratio = 0.85
+            prediction_frame = pd.DataFrame(raw_predictions, index=scores.index, columns=self.target_channels)
+            for channel in self.target_channels:
+                support = prediction_frame.drop(columns=channel).max(axis=1)
+                supported_near_hits = (
+                    support.rolling((2 * support_window) + 1, min_periods=1, center=True).max().to_numpy(dtype=np.uint8)
+                    > 0
+                )
+                near_threshold = smoothed_cache[channel] > (threshold_cache[channel] * near_threshold_ratio)
+                raw_predictions[channel] = np.maximum(
+                    raw_predictions[channel],
+                    (supported_near_hits & near_threshold).astype(np.uint8),
+                )
+
+        for channel in self.target_channels:
+            thresholded[channel] = self._postprocess_prediction_runs(raw_predictions[channel])
 
         return thresholded
 
