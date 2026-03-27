@@ -1399,6 +1399,42 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
+def restore_synchronized_score_onsets(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_channels: int,
+    onset_ratio: float,
+    restore_ratio: float,
+    neighborhood_points: int,
+    restore_points: int,
+) -> pd.DataFrame:
+    restored = predictions.copy()
+    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
+    score_ratios = score_values / thresholds.reshape(1, -1)
+    elevated = score_ratios >= onset_ratio
+    rising = elevated.copy()
+    rising[1:] &= ~elevated[:-1]
+
+    for index in np.flatnonzero(rising.sum(axis=1) >= min_channels):
+        left = max(0, index - neighborhood_points)
+        right = min(len(prediction_values), index + neighborhood_points + 1)
+        if prediction_values[left:right].any():
+            continue
+
+        restore_stop = min(len(prediction_values), index + max(1, restore_points))
+        rescue_mask = score_ratios[index:restore_stop].max(axis=0) >= restore_ratio
+        if int(rescue_mask.sum()) < min_channels:
+            continue
+        prediction_values[index:restore_stop, rescue_mask] = 1
+
+    restored[target_channels] = prediction_values
+    return restored
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1457,69 +1493,6 @@ def prune_noisy_channel_short_runs(
             if support.any():
                 continue
             series[run_start:run_stop] = 0
-
-        pruned[channel] = series
-
-    return pruned
-
-
-def prune_weak_long_memory_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_run_points: int,
-    max_peak_ratio: float,
-    max_mean_ratio: float,
-    support_padding: int,
-) -> pd.DataFrame:
-    pruned = predictions.copy()
-    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        run_start: int | None = None
-
-        for index, value in enumerate(series):
-            if value == 1:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-
-            run_stop = index
-            run_length = run_stop - run_start
-            if run_length >= min_run_points:
-                segment = channel_scores[run_start:run_stop]
-                peak_ratio = float(segment.max()) / threshold
-                mean_ratio = float(segment.mean()) / threshold
-                if peak_ratio <= max_peak_ratio and mean_ratio <= max_mean_ratio:
-                    support_start = max(0, run_start - support_padding)
-                    support_stop = min(len(series), run_stop + support_padding)
-                    support = prediction_values[support_start:support_stop].copy()
-                    support[:, channel_index] = 0
-                    if not support.any():
-                        series[run_start:run_stop] = 0
-            run_start = None
-
-        if run_start is not None:
-            run_stop = len(series)
-            run_length = run_stop - run_start
-            if run_length >= min_run_points:
-                segment = channel_scores[run_start:run_stop]
-                peak_ratio = float(segment.max()) / threshold
-                mean_ratio = float(segment.mean()) / threshold
-                if peak_ratio <= max_peak_ratio and mean_ratio <= max_mean_ratio:
-                    support_start = max(0, run_start - support_padding)
-                    support = prediction_values[support_start:run_stop].copy()
-                    support[:, channel_index] = 0
-                    if not support.any():
-                        series[run_start:run_stop] = 0
 
         pruned[channel] = series
 
@@ -1620,6 +1593,17 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
+    baseline_predictions = restore_synchronized_score_onsets(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_channels=4,
+        onset_ratio=1.0,
+        restore_ratio=1.1,
+        neighborhood_points=12,
+        restore_points=2,
+    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1656,16 +1640,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions = prune_weak_long_memory_runs(
-        predictions=gated_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_run_points=96,
-        max_peak_ratio=1.35,
-        max_mean_ratio=1.1,
-        support_padding=16,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
