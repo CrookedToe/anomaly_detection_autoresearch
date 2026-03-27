@@ -816,9 +816,6 @@ class TcnAnomalyPipeline:
     def _dynamic_threshold(self, scores: pd.DataFrame) -> pd.DataFrame:
         thresholded = pd.DataFrame(index=scores.index)
         global_thresholds = self.global_thresholds if self.global_thresholds is not None else np.zeros(len(self.target_channels))
-        raw_predictions: dict[str, np.ndarray] = {}
-        smoothed_cache: dict[str, np.ndarray] = {}
-        threshold_cache: dict[str, np.ndarray] = {}
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
@@ -842,44 +839,8 @@ class TcnAnomalyPipeline:
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            smoothed_values = smoothed_series.to_numpy(dtype=np.float32, copy=True)
-            threshold_values = threshold.to_numpy(dtype=np.float32, copy=True)
-            raw_predictions[channel] = (smoothed_values > threshold_values).astype(np.uint8, copy=False)
-            smoothed_cache[channel] = smoothed_values
-            threshold_cache[channel] = threshold_values
-
-        if len(self.target_channels) > 1:
-            prediction_frame = pd.DataFrame(raw_predictions, index=scores.index, columns=self.target_channels)
-            support_window = 8
-            near_threshold_ratio = 0.8
-            max_gap_points = 8
-            for channel in self.target_channels:
-                series = raw_predictions[channel].copy()
-                support = prediction_frame.drop(columns=channel).max(axis=1)
-                supported = (
-                    support.rolling((2 * support_window) + 1, min_periods=1, center=True).max().to_numpy(dtype=np.uint8)
-                    > 0
-                )
-                zero_start: int | None = None
-                for index, value in enumerate(series):
-                    if value == 0:
-                        if zero_start is None:
-                            zero_start = index
-                        continue
-                    if zero_start is None:
-                        continue
-                    gap_length = index - zero_start
-                    if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
-                        gap_near_threshold = smoothed_cache[channel][zero_start:index] > (
-                            threshold_cache[channel][zero_start:index] * near_threshold_ratio
-                        )
-                        if supported[zero_start:index].any() and gap_near_threshold.any():
-                            series[zero_start:index] = 1
-                    zero_start = None
-                raw_predictions[channel] = series
-
-        for channel in self.target_channels:
-            thresholded[channel] = self._postprocess_prediction_runs(raw_predictions[channel])
+            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
+            thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
 
@@ -1288,6 +1249,41 @@ def merge_supported_close_runs(
     return merged
 
 
+def restore_weak_long_memory_suppressions(
+    original_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    channel: str,
+    min_duration_seconds: float,
+    min_score: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    restored_predictions = gated_predictions.copy()
+    kept_events: list[dict[str, Any]] = []
+    restored_count = 0
+
+    for row in suppressed_events.to_dict("records"):
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
+        score = float(row["score"])
+        if duration_seconds >= min_duration_seconds and score < min_score:
+            restored_predictions.loc[start_time:end_time, channel] = original_predictions.loc[start_time:end_time, channel]
+            restored_count += 1
+            continue
+        kept_events.append(row)
+
+    if restored_count > 0:
+        log_debug(
+            f"[memory] restored channel={channel} weak_long_suppressions={restored_count} "
+            f"min_duration_seconds={min_duration_seconds:.0f} min_score={min_score:.3f}"
+        )
+
+    return restored_predictions, pd.DataFrame(kept_events, columns=suppressed_events.columns)
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1300,6 +1296,8 @@ def apply_same_channel_memory_gating(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
     suppressed_frames: list[pd.DataFrame] = []
+    long_run_restore_seconds = 600.0
+    long_run_restore_score = threshold + 0.02
 
     for channel in target_channels:
         channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
@@ -1319,6 +1317,14 @@ def apply_same_channel_memory_gating(
             metric=metric,
             threshold=threshold,
             vectorizer=vectorizer,
+        )
+        channel_gated, channel_suppressed = restore_weak_long_memory_suppressions(
+            original_predictions=predictions,
+            gated_predictions=channel_gated,
+            suppressed_events=channel_suppressed,
+            channel=channel,
+            min_duration_seconds=long_run_restore_seconds,
+            min_score=long_run_restore_score,
         )
         gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
         if not channel_suppressed.empty:
