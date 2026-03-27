@@ -1167,32 +1167,24 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
-def restore_confident_suppressed_runs(
-    baseline_scores: pd.DataFrame,
+def restore_multichannel_suppressed_runs(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
     suppressed_events: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray | None,
-    score_scale: float,
+    min_active_channels: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty or global_thresholds is None:
+    if suppressed_events.empty:
         return gated_predictions, suppressed_events
 
     restored = gated_predictions.copy()
     kept_suppressions: list[dict[str, Any]] = []
-    threshold_lookup = {channel: float(global_thresholds[index]) for index, channel in enumerate(target_channels)}
 
     for row in suppressed_events.to_dict("records"):
         channel = str(row["channel"])
         start_time = pd.Timestamp(row["start_time"])
         end_time = pd.Timestamp(row["end_time"])
-        run_scores = baseline_scores.loc[start_time:end_time, channel]
-        if run_scores.empty:
-            kept_suppressions.append(row)
-            continue
-        peak_score = float(run_scores.max())
-        if peak_score >= (threshold_lookup[channel] * score_scale):
+        concurrent_alerts = baseline_predictions.loc[start_time:end_time].sum(axis=1)
+        if not concurrent_alerts.empty and int(concurrent_alerts.max()) >= min_active_channels:
             restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
             continue
         kept_suppressions.append(row)
@@ -1246,14 +1238,11 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions, suppressed_events = restore_confident_suppressed_runs(
-        baseline_scores=baseline_scores,
+    gated_predictions, suppressed_events = restore_multichannel_suppressed_runs(
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
         suppressed_events=suppressed_events,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        score_scale=1.5,
+        min_active_channels=2,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
