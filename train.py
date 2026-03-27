@@ -1463,15 +1463,14 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def extend_supported_run_starts(
+def extend_very_high_confidence_run_starts(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
     min_run_points: int,
     min_peak_ratio: float,
-    support_score_ratio: float,
-    max_pre_points: int,
+    extra_pre_points: int,
 ) -> pd.DataFrame:
     extended = predictions.copy()
     prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
@@ -1499,14 +1498,8 @@ def extend_supported_run_starts(
             if run_length < min_run_points or run_peak_ratio < min_peak_ratio:
                 continue
 
-            extension_floor = threshold * support_score_ratio
-            left = run_start
-            while left > 0 and (run_start - left) < max_pre_points:
-                if series[left - 1] == 1 or channel_scores[left - 1] < extension_floor:
-                    break
-                left -= 1
-
-            series[left:run_start] = 1
+            extend_start = max(0, run_start - max(0, extra_pre_points))
+            series[extend_start:run_start] = 1
 
         extended[channel] = series
 
@@ -1607,15 +1600,14 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = extend_supported_run_starts(
+    baseline_predictions = extend_very_high_confidence_run_starts(
         predictions=baseline_predictions,
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_run_points=24,
-        min_peak_ratio=1.4,
-        support_score_ratio=0.95,
-        max_pre_points=2,
+        min_run_points=60,
+        min_peak_ratio=30.0,
+        extra_pre_points=1,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
