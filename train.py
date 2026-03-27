@@ -823,11 +823,12 @@ class TcnAnomalyPipeline:
                 self.config.score_smoothing_window,
                 min_periods=1,
             ).mean()
-            rolling_median = smoothed_series.rolling(
+            threshold_source = smoothed_series.shift(1)
+            rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
-            rolling_mad = (smoothed_series - rolling_median).abs().rolling(
+            rolling_mad = (threshold_source - rolling_median).abs().rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
