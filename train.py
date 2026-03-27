@@ -1506,26 +1506,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_ultra_long_suppressed_runs(
-    gated_predictions: pd.DataFrame,
-    baseline_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    min_duration: pd.Timedelta,
-) -> pd.DataFrame:
-    if suppressed_events.empty:
-        return gated_predictions
-
-    restored = gated_predictions.copy()
-    for row in suppressed_events.itertuples(index=False):
-        start_time = pd.Timestamp(row.start_time)
-        end_time = pd.Timestamp(row.end_time)
-        if end_time - start_time < min_duration:
-            continue
-        mask = (restored.index >= start_time) & (restored.index <= end_time)
-        restored.loc[mask, row.channel] = baseline_predictions.loc[mask, row.channel].astype(np.uint8)
-    return restored
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1614,11 +1594,11 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = restore_ultra_long_suppressed_runs(
-        gated_predictions=gated_predictions,
-        baseline_predictions=baseline_predictions,
-        suppressed_events=suppressed_events,
-        min_duration=pd.Timedelta(minutes=50),
+    gated_predictions = prune_short_isolated_runs(
+        predictions=gated_predictions,
+        target_channels=args.target_channels,
+        min_run_points=12,
+        support_padding=8,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
