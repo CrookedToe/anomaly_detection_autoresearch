@@ -1311,64 +1311,60 @@ def prune_weak_isolated_runs(
     return pruned
 
 
-def prune_noisy_channel_short_runs(
+def extend_high_confidence_run_edges(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
-    support_padding: int,
-    noisy_run_median_threshold: float,
-    noisy_peak_median_threshold: float,
-    min_run_points: int,
+    global_thresholds: np.ndarray,
+    min_run_peak_ratio: float,
+    extension_score_ratio: float,
+    max_extension_points: int,
 ) -> pd.DataFrame:
-    pruned = predictions.copy()
-    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
     score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
         series = prediction_values[:, channel_index].copy()
         channel_scores = score_values[:, channel_index]
-        runs: list[tuple[int, int, int, float]] = []
-        run_start: int | None = None
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
 
-        for index, value in enumerate(series):
-            if value == 1:
-                if run_start is None:
-                    run_start = index
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
                 continue
-            if run_start is None:
-                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
             run_stop = index
-            segment = channel_scores[run_start:run_stop]
-            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max())))
-            run_start = None
 
-        if run_start is not None:
-            run_stop = len(series)
-            segment = channel_scores[run_start:run_stop]
-            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max())))
-
-        if not runs:
-            continue
-
-        median_run_length = float(np.median([run[2] for run in runs]))
-        median_peak_score = float(np.median([run[3] for run in runs]))
-        if median_run_length > noisy_run_median_threshold or median_peak_score > noisy_peak_median_threshold:
-            continue
-
-        for run_start, run_stop, run_length, _ in runs:
-            if run_length >= min_run_points:
+            run_peak = float(channel_scores[run_start:run_stop].max())
+            if run_peak < (threshold * min_run_peak_ratio):
                 continue
-            support_start = max(0, run_start - support_padding)
-            support_stop = min(len(series), run_stop + support_padding)
-            support = prediction_values[support_start:support_stop].copy()
-            support[:, channel_index] = 0
-            if support.any():
-                continue
-            series[run_start:run_stop] = 0
 
-        pruned[channel] = series
+            extension_floor = threshold * extension_score_ratio
 
-    return pruned
+            left = run_start
+            while left > 0 and (run_start - left) < max_extension_points:
+                if series[left - 1] == 1 or channel_scores[left - 1] < extension_floor:
+                    break
+                left -= 1
+
+            right = run_stop
+            while right < len(series) and (right - run_stop) < max_extension_points:
+                if series[right] == 1 or channel_scores[right] < extension_floor:
+                    break
+                right += 1
+
+            series[left:right] = 1
+            index = max(index, right)
+
+        extended[channel] = series
+
+    return extended
 
 
 def apply_same_channel_memory_gating(
@@ -1450,16 +1446,15 @@ def run_tcn_split(
         peak_quantile=0.35,
         density_quantile=0.35,
     )
-    baseline_predictions = prune_noisy_channel_short_runs(
+    baseline_predictions = extend_high_confidence_run_edges(
         predictions=baseline_predictions,
         scores=baseline_scores,
         target_channels=args.target_channels,
-        support_padding=8,
-        noisy_run_median_threshold=8.0,
-        noisy_peak_median_threshold=1.5,
-        min_run_points=8,
+        global_thresholds=pipeline.global_thresholds,
+        min_run_peak_ratio=1.15,
+        extension_score_ratio=0.8,
+        max_extension_points=6,
     )
-
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
