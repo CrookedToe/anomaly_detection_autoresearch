@@ -816,6 +816,8 @@ class TcnAnomalyPipeline:
     def _dynamic_threshold(self, scores: pd.DataFrame) -> pd.DataFrame:
         thresholded = pd.DataFrame(index=scores.index)
         global_thresholds = self.global_thresholds if self.global_thresholds is not None else np.zeros(len(self.target_channels))
+        smoothed_values = np.zeros((len(scores), len(self.target_channels)), dtype=np.float32)
+        threshold_values = np.zeros((len(scores), len(self.target_channels)), dtype=np.float32)
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
@@ -838,8 +840,21 @@ class TcnAnomalyPipeline:
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
-            threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
+            threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index]).astype(
+                np.float32
+            )
+            smoothed_values[:, channel_index] = smoothed_series.to_numpy(dtype=np.float32, copy=True)
+            threshold_values[:, channel_index] = threshold.to_numpy(dtype=np.float32, copy=True)
+
+        support_active = smoothed_values >= (threshold_values * 0.98)
+
+        for channel_index, channel in enumerate(self.target_channels):
+            support_counts = support_active.sum(axis=1) - support_active[:, channel_index].astype(np.int32)
+            adjusted_threshold = threshold_values[:, channel_index].copy()
+            supported = support_counts >= 2
+            supported_floor = max(float(global_thresholds[channel_index]) * 0.96, EPSILON)
+            adjusted_threshold[supported] = np.maximum(adjusted_threshold[supported] * 0.96, supported_floor)
+            raw_prediction = (smoothed_values[:, channel_index] > adjusted_threshold).astype(np.uint8)
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
@@ -1463,73 +1478,6 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def restore_consensus_score_segments(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_consensus_channels: int,
-    support_score_ratio: float,
-    anchor_score_ratio: float,
-    min_segment_points: int,
-    max_gap_points: int,
-    pre_points: int,
-    post_points: int,
-) -> pd.DataFrame:
-    restored = predictions.copy()
-    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-    ratio_values = score_values / thresholds[None, :]
-
-    consensus = (ratio_values >= support_score_ratio).sum(axis=1).astype(np.uint8)
-    mask = consensus >= min_consensus_channels
-    if max_gap_points > 0:
-        zero_start: int | None = None
-        for index, value in enumerate(mask):
-            if value:
-                if zero_start is not None and zero_start > 0 and (index - zero_start) <= max_gap_points and mask[zero_start - 1]:
-                    mask[zero_start:index] = True
-                zero_start = None
-                continue
-            if zero_start is None:
-                zero_start = index
-
-    segment_start: int | None = None
-    for index, value in enumerate(mask):
-        if value and segment_start is None:
-            segment_start = index
-            continue
-        if value:
-            continue
-        if segment_start is None:
-            continue
-        segment_stop = index
-        if (segment_stop - segment_start) >= min_segment_points:
-            segment_ratios = ratio_values[segment_start:segment_stop]
-            channel_peaks = segment_ratios.max(axis=0)
-            if (channel_peaks >= anchor_score_ratio).any():
-                restore_channels = channel_peaks >= support_score_ratio
-                if int(restore_channels.sum()) >= min_consensus_channels:
-                    start = max(0, segment_start - pre_points)
-                    stop = min(len(mask), segment_stop + post_points)
-                    prediction_values[start:stop, restore_channels] = 1
-        segment_start = None
-
-    if segment_start is not None and (len(mask) - segment_start) >= min_segment_points:
-        segment_ratios = ratio_values[segment_start:]
-        channel_peaks = segment_ratios.max(axis=0)
-        if (channel_peaks >= anchor_score_ratio).any():
-            restore_channels = channel_peaks >= support_score_ratio
-            if int(restore_channels.sum()) >= min_consensus_channels:
-                start = max(0, segment_start - pre_points)
-                prediction_values[start:, restore_channels] = 1
-
-    for channel_index, channel in enumerate(target_channels):
-        restored[channel] = prediction_values[:, channel_index]
-    return restored
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1634,19 +1582,6 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
-    )
-    baseline_predictions = restore_consensus_score_segments(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_consensus_channels=3,
-        support_score_ratio=1.15,
-        anchor_score_ratio=1.6,
-        min_segment_points=4,
-        max_gap_points=2,
-        pre_points=1,
-        post_points=0,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
