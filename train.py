@@ -492,12 +492,14 @@ class TcnAnomalyPipeline:
             xp = self.cp
             forecast_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
+            forecast_peak = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
         else:
             xp = np
             forecast_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
+            forecast_peak = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
 
@@ -540,6 +542,11 @@ class TcnAnomalyPipeline:
                             future_indices[valid_mask],
                             1.0,
                         )
+                        self.cp.maximum.at(
+                            forecast_peak[:, channel_index],
+                            future_indices[valid_mask],
+                            forecast_error[:, :, channel_index][valid_mask],
+                        )
                 else:
                     forecast_error = forecast_error_t.cpu().numpy()
                     reconstruction_error = reconstruction_error_t.cpu().numpy()
@@ -557,16 +564,30 @@ class TcnAnomalyPipeline:
                                 break
                             forecast_sum[future_index] += forecast_error[row_index, horizon_offset]
                             forecast_count[future_index] += 1.0
+                            forecast_peak[future_index] = np.maximum(
+                                forecast_peak[future_index],
+                                forecast_error[row_index, horizon_offset],
+                            )
 
         if self.cp is not None:
-            forecast_scores = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
+            forecast_mean = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
+            forecast_scores = xp.where(
+                forecast_count > 0,
+                (0.6 * forecast_mean) + (0.4 * forecast_peak),
+                0.0,
+            )
             recon_scores = xp.where(recon_count > 0, recon_sum / xp.maximum(recon_count, 1.0), 0.0)
         else:
-            forecast_scores = np.divide(
+            forecast_mean = np.divide(
                 forecast_sum,
                 np.maximum(forecast_count, 1.0),
                 out=np.zeros_like(forecast_sum),
                 where=forecast_count > 0,
+            )
+            forecast_scores = np.where(
+                forecast_count > 0,
+                (0.6 * forecast_mean) + (0.4 * forecast_peak),
+                0.0,
             )
             recon_scores = np.divide(
                 recon_sum,
@@ -1399,43 +1420,6 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def expand_supported_run_boundaries(
-    predictions: pd.DataFrame,
-    target_channels: list[str],
-    min_support_channels: int,
-    pre_points: int,
-    post_points: int,
-) -> pd.DataFrame:
-    expanded = predictions.copy()
-    prediction_values = expanded[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
-
-            support = prediction_values[run_start:run_stop].sum(axis=1) - 1
-            if support.size == 0 or int(support.max()) < min_support_channels:
-                continue
-
-            expand_start = max(0, run_start - max(0, pre_points))
-            expand_stop = min(len(series), run_stop + max(0, post_points))
-            series[expand_start:expand_stop] = 1
-
-        expanded[channel] = series
-
-    return expanded
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1604,13 +1588,6 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
-    )
-    baseline_predictions = expand_supported_run_boundaries(
-        predictions=baseline_predictions,
-        target_channels=args.target_channels,
-        min_support_channels=3,
-        pre_points=1,
-        post_points=1,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
