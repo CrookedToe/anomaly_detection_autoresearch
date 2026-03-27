@@ -1506,75 +1506,53 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def prune_reactivated_hitchhiker_runs(
-    predictions: pd.DataFrame,
+def restore_strong_near_threshold_suppressions(
+    suppressed_events: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    baseline_predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
-    min_gap_points: int,
-    max_run_points: int,
-    min_other_support: int,
-    max_start_score_ratio: float,
-) -> pd.DataFrame:
-    pruned = predictions.copy()
-    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    memory_threshold: float,
+    max_memory_margin: float,
+    min_run_points: int,
+    min_peak_ratio: float,
+    min_other_support: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    restored = gated_predictions.copy()
+    remaining_mask = np.ones(len(suppressed_events), dtype=bool)
     thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
+    baseline_values = baseline_predictions[target_channels]
 
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = float(thresholds[channel_index])
-        previous_run_stop: int | None = None
-        index = 0
+    for row_index, row in enumerate(suppressed_events.itertuples(index=False)):
+        try:
+            channel_index = target_channels.index(row.channel)
+        except ValueError:
+            continue
 
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
+        if float(row.score) > (memory_threshold + max_memory_margin):
+            continue
 
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
+        run_scores = scores.loc[row.start_time : row.end_time, row.channel]
+        if run_scores.empty:
+            continue
 
-            if previous_run_stop is None:
-                previous_run_stop = run_stop
-                continue
+        run_length = len(run_scores)
+        peak_ratio = float(run_scores.max()) / float(thresholds[channel_index])
+        support_frame = baseline_values.loc[row.start_time : row.end_time].copy()
+        support_frame[row.channel] = 0
+        other_support = float(support_frame.sum(axis=1).mean()) if not support_frame.empty else 0.0
 
-            gap_start = previous_run_stop
-            gap_length = run_start - gap_start
-            run_length = run_stop - run_start
-            if gap_length < min_gap_points or run_length > max_run_points:
-                previous_run_stop = run_stop
-                continue
+        if run_length < min_run_points or peak_ratio < min_peak_ratio or other_support < min_other_support:
+            continue
 
-            gap_support = prediction_values[gap_start:run_start].copy()
-            gap_support[:, channel_index] = 0
-            run_support = prediction_values[run_start:run_stop].copy()
-            run_support[:, channel_index] = 0
-            if gap_support.size == 0 or run_support.size == 0:
-                previous_run_stop = run_stop
-                continue
+        restored.loc[row.start_time : row.end_time, row.channel] = baseline_predictions.loc[row.start_time : row.end_time, row.channel]
+        remaining_mask[row_index] = False
 
-            if (
-                float(gap_support.sum(axis=1).mean()) < min_other_support
-                or float(run_support.sum(axis=1).mean()) < min_other_support
-            ):
-                previous_run_stop = run_stop
-                continue
-
-            start_score_ratio = float(channel_scores[run_start]) / threshold
-            if start_score_ratio > max_start_score_ratio:
-                previous_run_stop = run_stop
-                continue
-
-            series[run_start:run_stop] = 0
-            previous_run_stop = run_stop
-
-        pruned[channel] = series
-
-    return pruned
+    return restored, suppressed_events.loc[remaining_mask].reset_index(drop=True)
 
 
 def run_tcn_split(
@@ -1665,15 +1643,18 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = prune_reactivated_hitchhiker_runs(
-        predictions=gated_predictions,
+    gated_predictions, suppressed_events = restore_strong_near_threshold_suppressions(
+        suppressed_events=suppressed_events,
+        gated_predictions=gated_predictions,
+        baseline_predictions=baseline_predictions,
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_gap_points=4,
-        max_run_points=12,
-        min_other_support=3,
-        max_start_score_ratio=0.85,
+        memory_threshold=resolved_args["memory_threshold"],
+        max_memory_margin=0.02,
+        min_run_points=48,
+        min_peak_ratio=2.5,
+        min_other_support=2.5,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
