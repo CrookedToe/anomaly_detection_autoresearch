@@ -26,8 +26,9 @@ from prepare import (
     PRIMARY_METRIC_DIRECTION,
     PRIMARY_METRIC_KEY,
     READING_MATERIALS_DIR,
-    apply_memory_gating,
+    cosine_similarity,
     compute_esa_metrics,
+    extract_centered_windows_array,
     load_split_data,
     log_debug,
     reading_materials_snapshot,
@@ -36,6 +37,7 @@ from prepare import (
     save_detector_results,
     summarize_detector_run,
     summarize_suppressions,
+    windows_to_vectors,
     write_json,
 )
 
@@ -487,7 +489,6 @@ class TcnAnomalyPipeline:
         base_features, raw_targets = self._transform_frame(frame)
         n_rows = len(frame)
         target_dim = len(self.target_channels)
-        horizon_weight_values = np.linspace(1.0, 0.5, num=self.config.horizon, dtype=np.float32)
 
         if self.cp is not None:
             xp = self.cp
@@ -495,14 +496,12 @@ class TcnAnomalyPipeline:
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
-            horizon_weights = xp.asarray(horizon_weight_values, dtype=xp.float32)
         else:
             xp = np
             forecast_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
-            horizon_weights = horizon_weight_values
 
         batch_size = self.config.batch_size
         with torch.no_grad():
@@ -536,14 +535,12 @@ class TcnAnomalyPipeline:
                         self.cp.add.at(
                             forecast_sum[:, channel_index],
                             future_indices[valid_mask],
-                            (forecast_error[:, :, channel_index] * horizon_weights[None, :])[valid_mask],
+                            forecast_error[:, :, channel_index][valid_mask],
                         )
                         self.cp.add.at(
                             forecast_count[:, channel_index],
                             future_indices[valid_mask],
-                            self.cp.broadcast_to(horizon_weights[None, :], forecast_error[:, :, channel_index].shape)[
-                                valid_mask
-                            ],
+                            1.0,
                         )
                 else:
                     forecast_error = forecast_error_t.cpu().numpy()
@@ -560,9 +557,8 @@ class TcnAnomalyPipeline:
                         for horizon_offset, future_index in enumerate(future_indices):
                             if future_index >= n_rows:
                                 break
-                            weight = float(horizon_weights[horizon_offset])
-                            forecast_sum[future_index] += forecast_error[row_index, horizon_offset] * weight
-                            forecast_count[future_index] += weight
+                            forecast_sum[future_index] += forecast_error[row_index, horizon_offset]
+                            forecast_count[future_index] += 1.0
 
         if self.cp is not None:
             forecast_scores = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
@@ -1470,6 +1466,7 @@ def prune_noisy_channel_short_runs(
 
 
 def apply_same_channel_memory_gating(
+    train_frame: pd.DataFrame,
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
     target_channels: list[str],
@@ -1478,6 +1475,7 @@ def apply_same_channel_memory_gating(
     metric: str,
     threshold: float,
     vectorizer: Any | None = None,
+    shape_similarity_threshold: float = 0.3,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
     suppressed_frames: list[pd.DataFrame] = []
@@ -1487,23 +1485,71 @@ def apply_same_channel_memory_gating(
         if not channel_prototypes:
             continue
         channel_bank = RareNominalMemoryBank(channel_prototypes)
-        channel_predictions = predictions.copy()
-        for other_channel in target_channels:
-            if other_channel != channel:
-                channel_predictions[other_channel] = 0
-        channel_gated, channel_suppressed = apply_memory_gating(
-            frame=frame,
-            predictions=channel_predictions,
-            target_channels=target_channels,
-            memory_bank=channel_bank,
-            half_window=half_window,
-            metric=metric,
-            threshold=threshold,
-            vectorizer=vectorizer,
+        prototype_centers = [
+            pd.Timestamp(prototype.start_time)
+            + ((pd.Timestamp(prototype.end_time) - pd.Timestamp(prototype.start_time)) / 2)
+            for prototype in channel_prototypes
+        ]
+        prototype_windows = extract_centered_windows_array(
+            train_frame,
+            prototype_centers,
+            target_channels,
+            half_window,
         )
-        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
-        if not channel_suppressed.empty:
-            suppressed_frames.append(channel_suppressed)
+        prototype_shape_vectors = windows_to_vectors(prototype_windows)
+        prototype_shape_lookup = {
+            prototype.prototype_id: shape_vector
+            for prototype, shape_vector in zip(channel_prototypes, prototype_shape_vectors)
+        }
+
+        run_series = predictions[channel].astype(np.uint8)
+        candidate_events: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
+        active_start: pd.Timestamp | None = None
+        previous_index: pd.Timestamp | None = None
+        for timestamp, value in run_series.items():
+            current_timestamp = pd.Timestamp(timestamp)
+            if int(value) == 1 and active_start is None:
+                active_start = current_timestamp
+            elif int(value) == 0 and active_start is not None and previous_index is not None:
+                center_time = active_start + ((previous_index - active_start) / 2)
+                candidate_events.append((active_start, previous_index, center_time))
+                active_start = None
+            previous_index = current_timestamp
+        if active_start is not None and previous_index is not None:
+            center_time = active_start + ((previous_index - active_start) / 2)
+            candidate_events.append((active_start, previous_index, center_time))
+
+        if not candidate_events:
+            continue
+
+        center_times = [center_time for _, _, center_time in candidate_events]
+        query_windows = extract_centered_windows_array(frame, center_times, target_channels, half_window)
+        query_vectors = vectorizer(query_windows) if vectorizer is not None else windows_to_vectors(query_windows)
+        query_shape_vectors = windows_to_vectors(query_windows)
+        matches = channel_bank.query_many(query_vectors=query_vectors, metric=metric, threshold=threshold)
+
+        channel_suppressed_rows: list[dict[str, Any]] = []
+        for (start_time, end_time, _), match, query_shape_vector in zip(candidate_events, matches, query_shape_vectors):
+            if match is None:
+                continue
+            prototype_shape_vector = prototype_shape_lookup.get(match.prototype.prototype_id)
+            if prototype_shape_vector is None:
+                continue
+            if cosine_similarity(query_shape_vector, prototype_shape_vector) < shape_similarity_threshold:
+                continue
+            gated_predictions.loc[start_time:end_time, channel] = 0
+            channel_suppressed_rows.append(
+                {
+                    "channel": channel,
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "prototype_id": match.prototype.prototype_id,
+                    "score": match.score,
+                    "metric": match.metric,
+                }
+            )
+        if channel_suppressed_rows:
+            suppressed_frames.append(pd.DataFrame(channel_suppressed_rows))
 
     if suppressed_frames:
         suppressed_events = pd.concat(suppressed_frames, ignore_index=True)
@@ -1591,6 +1637,7 @@ def run_tcn_split(
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
+        train_frame=train_df,
         frame=test_df,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
