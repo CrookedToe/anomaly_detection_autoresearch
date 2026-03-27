@@ -1399,41 +1399,59 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def expand_supported_run_boundaries(
+def restore_consensus_score_runs(
     predictions: pd.DataFrame,
+    scores: pd.DataFrame,
     target_channels: list[str],
+    global_thresholds: np.ndarray,
     min_support_channels: int,
-    pre_points: int,
-    post_points: int,
+    min_consensus_ratio: float,
+    min_channel_ratio: float,
+    min_run_points: int,
+    max_gap_points: int,
 ) -> pd.DataFrame:
-    expanded = predictions.copy()
-    prediction_values = expanded[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    restored = predictions.copy()
+    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
+    score_ratios = score_values / thresholds.reshape(1, -1)
 
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
+    consensus = (score_ratios >= min_consensus_ratio).sum(axis=1) >= min_support_channels
+    if max_gap_points > 0:
+        zero_start: int | None = None
+        for index, is_consensus in enumerate(consensus):
+            if not is_consensus:
+                if zero_start is None:
+                    zero_start = index
                 continue
+            if zero_start is not None:
+                gap_length = index - zero_start
+                if zero_start > 0 and gap_length <= max_gap_points and consensus[zero_start - 1]:
+                    consensus[zero_start:index] = True
+                zero_start = None
 
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
+    index = 0
+    while index < len(consensus):
+        if not consensus[index]:
+            index += 1
+            continue
 
-            support = prediction_values[run_start:run_stop].sum(axis=1) - 1
-            if support.size == 0 or int(support.max()) < min_support_channels:
-                continue
+        run_start = index
+        while index < len(consensus) and consensus[index]:
+            index += 1
+        run_stop = index
 
-            expand_start = max(0, run_start - max(0, pre_points))
-            expand_stop = min(len(series), run_stop + max(0, post_points))
-            series[expand_start:expand_stop] = 1
+        if run_stop - run_start < min_run_points:
+            continue
 
-        expanded[channel] = series
+        restore_mask = score_ratios[run_start:run_stop] >= min_channel_ratio
+        prediction_values[run_start:run_stop] = np.maximum(
+            prediction_values[run_start:run_stop],
+            restore_mask.astype(np.uint8),
+        )
 
-    return expanded
+    restored[target_channels] = prediction_values
+    return restored
 
 
 def prune_noisy_channel_short_runs(
@@ -1605,12 +1623,16 @@ def run_tcn_split(
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
     )
-    baseline_predictions = expand_supported_run_boundaries(
+    baseline_predictions = restore_consensus_score_runs(
         predictions=baseline_predictions,
+        scores=baseline_scores,
         target_channels=args.target_channels,
-        min_support_channels=3,
-        pre_points=1,
-        post_points=1,
+        global_thresholds=pipeline.global_thresholds,
+        min_support_channels=4,
+        min_consensus_ratio=1.15,
+        min_channel_ratio=1.0,
+        min_run_points=8,
+        max_gap_points=2,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
