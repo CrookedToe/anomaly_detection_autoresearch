@@ -1431,71 +1431,6 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def prune_fragmented_channel_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    support_padding: int,
-    short_run_points: int,
-    min_short_run_fraction: float,
-    min_run_count: int,
-    max_channel_peak_ratio_median: float,
-    max_pruned_run_peak_ratio: float,
-) -> pd.DataFrame:
-    pruned = predictions.copy()
-    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        runs: list[tuple[int, int, int, float]] = []
-        run_start: int | None = None
-
-        for index, value in enumerate(series):
-            if value == 1:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            segment = channel_scores[run_start:run_stop]
-            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
-            run_start = None
-
-        if run_start is not None:
-            run_stop = len(series)
-            segment = channel_scores[run_start:run_stop]
-            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
-
-        if len(runs) < min_run_count:
-            continue
-
-        short_run_fraction = float(np.mean([run_length <= short_run_points for _, _, run_length, _ in runs]))
-        median_peak_ratio = float(np.median([peak_ratio for _, _, _, peak_ratio in runs]))
-        if short_run_fraction < min_short_run_fraction or median_peak_ratio > max_channel_peak_ratio_median:
-            continue
-
-        for run_start, run_stop, run_length, peak_ratio in runs:
-            if run_length > short_run_points or peak_ratio > max_pruned_run_peak_ratio:
-                continue
-            support_start = max(0, run_start - support_padding)
-            support_stop = min(len(series), run_stop + support_padding)
-            support = prediction_values[support_start:support_stop].copy()
-            support[:, channel_index] = 0
-            if support.any():
-                continue
-            series[run_start:run_stop] = 0
-
-        pruned[channel] = series
-
-    return pruned
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1537,6 +1472,45 @@ def apply_same_channel_memory_gating(
     else:
         suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
     return gated_predictions, suppressed_events
+
+
+def restore_cross_channel_supported_suppressions(
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    baseline_predictions: pd.DataFrame,
+    target_channels: list[str],
+    support_padding: int,
+    min_support_points: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    restored = gated_predictions.copy()
+    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    index = baseline_predictions.index
+    channel_to_index = {channel: channel_index for channel_index, channel in enumerate(target_channels)}
+    kept_rows: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict("records"):
+        channel = str(row["channel"])
+        channel_index = channel_to_index.get(channel)
+        if channel_index is None:
+            kept_rows.append(row)
+            continue
+
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        left = max(0, int(index.searchsorted(start_time, side="left")) - support_padding)
+        right = min(len(index), int(index.searchsorted(end_time, side="right")) + support_padding)
+        support = baseline_values[left:right].copy()
+        support[:, channel_index] = 0
+        if int(support.sum()) < min_support_points:
+            kept_rows.append(row)
+            continue
+
+        restored.loc[start_time:end_time, channel] = 1
+
+    return restored, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
 def run_tcn_split(
@@ -1595,18 +1569,6 @@ def run_tcn_split(
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
     )
-    baseline_predictions = prune_fragmented_channel_runs(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        short_run_points=10,
-        min_short_run_fraction=0.5,
-        min_run_count=12,
-        max_channel_peak_ratio_median=1.45,
-        max_pruned_run_peak_ratio=1.5,
-    )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1632,6 +1594,14 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions, suppressed_events = restore_cross_channel_supported_suppressions(
+        gated_predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        baseline_predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        support_padding=8,
+        min_support_points=4,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
