@@ -1367,60 +1367,6 @@ def extend_high_confidence_run_edges(
     return extended
 
 
-def prune_unsupported_extended_points(
-    original_predictions: pd.DataFrame,
-    extended_predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    support_padding: int,
-    max_added_peak_ratio: float,
-) -> pd.DataFrame:
-    pruned = extended_predictions.copy()
-    original_values = original_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
-    extended_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        original_series = original_values[:, channel_index]
-        extended_series = extended_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        added_mask = (extended_series == 1) & (original_series == 0)
-        run_start: int | None = None
-
-        for index, is_added in enumerate(added_mask):
-            if is_added:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            support_start = max(0, run_start - support_padding)
-            support_stop = min(len(extended_series), run_stop + support_padding)
-            support = extended_values[support_start:support_stop].copy()
-            support[:, channel_index] = 0
-            peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if not support.any() and peak_ratio <= max_added_peak_ratio:
-                extended_series[run_start:run_stop] = 0
-            run_start = None
-
-        if run_start is not None:
-            run_stop = len(extended_series)
-            support_start = max(0, run_start - support_padding)
-            support = extended_values[support_start:run_stop].copy()
-            support[:, channel_index] = 0
-            peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if not support.any() and peak_ratio <= max_added_peak_ratio:
-                extended_series[run_start:run_stop] = 0
-
-        pruned[channel] = extended_series
-
-    return pruned
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1564,7 +1510,6 @@ def run_tcn_split(
         peak_quantile=0.35,
         density_quantile=0.35,
     )
-    pre_extension_predictions = baseline_predictions.copy()
     baseline_predictions = extend_high_confidence_run_edges(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1573,15 +1518,6 @@ def run_tcn_split(
         min_run_peak_ratio=1.15,
         extension_score_ratio=0.8,
         max_extension_points=6,
-    )
-    baseline_predictions = prune_unsupported_extended_points(
-        original_predictions=pre_extension_predictions,
-        extended_predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        max_added_peak_ratio=1.05,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
