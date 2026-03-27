@@ -1399,53 +1399,6 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def prune_late_join_hitchhiker_runs(
-    predictions: pd.DataFrame,
-    target_channels: list[str],
-    max_run_points: int,
-    pre_points: int,
-    min_other_active_points: int,
-    min_other_active_channels: int,
-) -> pd.DataFrame:
-    pruned = predictions.copy()
-    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        other_values = np.delete(prediction_values, channel_index, axis=1)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
-
-            run_length = run_stop - run_start
-            if run_length > max_run_points or run_start < pre_points:
-                continue
-
-            pre_support = other_values[run_start - pre_points : run_start].sum(axis=1)
-            if len(pre_support) < pre_points:
-                continue
-            if int(other_values[run_start].sum()) < min_other_active_channels:
-                continue
-            if (pre_support < min_other_active_channels).any():
-                continue
-            if int(pre_support.sum()) < min_other_active_points:
-                continue
-
-            series[run_start:run_stop] = 0
-
-        pruned[channel] = series
-
-    return pruned
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1553,6 +1506,56 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def restore_extreme_consensus_spikes(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_consensus_channels: int,
+    min_channel_ratio: float,
+    max_segment_points: int,
+    backfill_points: int,
+    isolation_padding: int,
+) -> pd.DataFrame:
+    restored = predictions.copy()
+    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
+    score_ratios = score_values / thresholds[None, :]
+    active_any = prediction_values.any(axis=1)
+    consensus_mask = (score_ratios >= min_channel_ratio).sum(axis=1) >= min_consensus_channels
+    consensus_mask &= ~active_any
+
+    index = 0
+    while index < len(consensus_mask):
+        if not consensus_mask[index]:
+            index += 1
+            continue
+
+        segment_start = index
+        while index < len(consensus_mask) and consensus_mask[index]:
+            index += 1
+        segment_stop = index
+
+        if (segment_stop - segment_start) > max_segment_points:
+            continue
+
+        support_start = max(0, segment_start - isolation_padding)
+        support_stop = min(len(active_any), segment_stop + isolation_padding)
+        if active_any[support_start:support_stop].any():
+            continue
+
+        restore_start = max(0, segment_start - backfill_points)
+        restore_stop = segment_stop
+        segment_ratios = score_ratios[segment_start:segment_stop]
+        for channel_index, channel in enumerate(target_channels):
+            if float(segment_ratios[:, channel_index].max()) < min_channel_ratio:
+                continue
+            restored.iloc[restore_start:restore_stop, restored.columns.get_loc(channel)] = 1
+
+    return restored
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1604,14 +1607,6 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = prune_late_join_hitchhiker_runs(
-        predictions=baseline_predictions,
-        target_channels=args.target_channels,
-        max_run_points=12,
-        pre_points=8,
-        min_other_active_points=28,
-        min_other_active_channels=4,
-    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1648,6 +1643,17 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = restore_extreme_consensus_spikes(
+        predictions=gated_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_consensus_channels=6,
+        min_channel_ratio=8.0,
+        max_segment_points=12,
+        backfill_points=6,
+        isolation_padding=24,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
