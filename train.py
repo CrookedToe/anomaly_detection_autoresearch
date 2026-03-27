@@ -1474,43 +1474,109 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_cross_channel_supported_suppressions(
-    gated_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    baseline_predictions: pd.DataFrame,
+def select_weak_isolated_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
     target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    max_peak_ratio: float,
     support_padding: int,
-    min_support_points: int,
+) -> pd.DataFrame:
+    weak_predictions = pd.DataFrame(0, index=predictions.index, columns=target_channels, dtype=np.uint8)
+    prediction_values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index]
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            run_length = run_stop - run_start
+            if run_length <= max_run_points:
+                peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+                if peak_ratio <= max_peak_ratio:
+                    support_start = max(0, run_start - support_padding)
+                    support_stop = min(len(series), run_stop + support_padding)
+                    support = prediction_values[support_start:support_stop].copy()
+                    support[:, channel_index] = 0
+                    if not support.any():
+                        weak_predictions.iloc[run_start:run_stop, channel_index] = 1
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            run_length = run_stop - run_start
+            if run_length <= max_run_points:
+                peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+                if peak_ratio <= max_peak_ratio:
+                    support_start = max(0, run_start - support_padding)
+                    support_stop = min(len(series), run_stop + support_padding)
+                    support = prediction_values[support_start:support_stop].copy()
+                    support[:, channel_index] = 0
+                    if not support.any():
+                        weak_predictions.iloc[run_start:run_stop, channel_index] = 1
+
+    return weak_predictions
+
+
+def apply_relaxed_memory_gating_to_weak_runs(
+    frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    memory_bank: RareNominalMemoryBank,
+    half_window: int,
+    metric: str,
+    relaxed_threshold: float,
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    max_peak_ratio: float,
+    support_padding: int,
+    vectorizer: Any | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
+    weak_predictions = select_weak_isolated_runs(
+        predictions=predictions,
+        scores=scores,
+        target_channels=target_channels,
+        global_thresholds=global_thresholds,
+        max_run_points=max_run_points,
+        max_peak_ratio=max_peak_ratio,
+        support_padding=support_padding,
+    )
+    if int(weak_predictions.to_numpy(dtype=np.uint8, copy=False).sum()) == 0:
+        return predictions, pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
 
-    restored = gated_predictions.copy()
-    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
-    index = baseline_predictions.index
-    channel_to_index = {channel: channel_index for channel_index, channel in enumerate(target_channels)}
-    kept_rows: list[dict[str, Any]] = []
+    weak_gated, weak_suppressed = apply_same_channel_memory_gating(
+        frame=frame,
+        predictions=weak_predictions,
+        target_channels=target_channels,
+        memory_bank=memory_bank,
+        half_window=half_window,
+        metric=metric,
+        threshold=relaxed_threshold,
+        vectorizer=vectorizer,
+    )
+    if weak_suppressed.empty:
+        return predictions, weak_suppressed
 
-    for row in suppressed_events.to_dict("records"):
-        channel = str(row["channel"])
-        channel_index = channel_to_index.get(channel)
-        if channel_index is None:
-            kept_rows.append(row)
-            continue
-
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        left = max(0, int(index.searchsorted(start_time, side="left")) - support_padding)
-        right = min(len(index), int(index.searchsorted(end_time, side="right")) + support_padding)
-        support = baseline_values[left:right].copy()
-        support[:, channel_index] = 0
-        if int(support.sum()) < min_support_points:
-            kept_rows.append(row)
-            continue
-
-        restored.loc[start_time:end_time, channel] = 1
-
-    return restored, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+    relaxed_gated = predictions.copy()
+    weak_values = weak_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    weak_gated_values = weak_gated[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    relaxed_values = relaxed_gated[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    relaxed_values[(weak_values == 1) & (weak_gated_values == 0)] = 0
+    relaxed_gated[target_channels] = relaxed_values
+    return relaxed_gated, weak_suppressed
 
 
 def run_tcn_split(
@@ -1595,14 +1661,23 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions, suppressed_events = restore_cross_channel_supported_suppressions(
-        gated_predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        baseline_predictions=baseline_predictions,
+    gated_predictions, relaxed_suppressed_events = apply_relaxed_memory_gating_to_weak_runs(
+        frame=test_df,
+        predictions=gated_predictions,
+        scores=baseline_scores,
         target_channels=args.target_channels,
+        memory_bank=memory_bank,
+        half_window=resolved_args["half_window"],
+        metric=args.metric,
+        relaxed_threshold=0.89,
+        global_thresholds=pipeline.global_thresholds,
+        max_run_points=12,
+        max_peak_ratio=1.35,
         support_padding=8,
-        min_support_points=4,
+        vectorizer=pipeline.vectorize_windows,
     )
+    if not relaxed_suppressed_events.empty:
+        suppressed_events = pd.concat([suppressed_events, relaxed_suppressed_events], ignore_index=True)
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
