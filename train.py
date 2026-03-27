@@ -1463,14 +1463,14 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def extend_very_high_confidence_run_starts(
+def pad_extreme_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
-    min_run_points: int,
+    max_run_points: int,
     min_peak_ratio: float,
-    extra_pre_points: int,
+    pad_points: int,
 ) -> pd.DataFrame:
     extended = predictions.copy()
     prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
@@ -1495,11 +1495,12 @@ def extend_very_high_confidence_run_starts(
 
             run_length = run_stop - run_start
             run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if run_length < min_run_points or run_peak_ratio < min_peak_ratio:
+            if run_length > max_run_points or run_peak_ratio < min_peak_ratio:
                 continue
 
-            extend_start = max(0, run_start - max(0, extra_pre_points))
-            series[extend_start:run_start] = 1
+            extend_start = max(0, run_start - max(0, pad_points))
+            extend_stop = min(len(series), run_stop + max(0, pad_points))
+            series[extend_start:extend_stop] = 1
 
         extended[channel] = series
 
@@ -1547,42 +1548,6 @@ def apply_same_channel_memory_gating(
     else:
         suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
     return gated_predictions, suppressed_events
-
-
-def restore_duration_mismatched_suppressions(
-    predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    memory_bank: RareNominalMemoryBank,
-    min_duration_ratio: float,
-    max_match_score: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return predictions, suppressed_events
-
-    prototype_duration_seconds: dict[str, float] = {}
-    for prototype in memory_bank.prototypes:
-        start_time = pd.Timestamp(prototype.start_time)
-        end_time = pd.Timestamp(prototype.end_time)
-        prototype_duration_seconds[prototype.prototype_id] = max((end_time - start_time).total_seconds(), 30.0)
-
-    restored = predictions.copy()
-    kept_rows: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict("records"):
-        match_score = float(row["score"])
-        prototype_duration = prototype_duration_seconds.get(str(row["prototype_id"]))
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        run_duration = max((end_time - start_time).total_seconds(), 30.0)
-        duration_ratio = None if prototype_duration is None else (run_duration / prototype_duration)
-
-        if duration_ratio is not None and duration_ratio >= min_duration_ratio and match_score <= max_match_score:
-            restored.loc[start_time:end_time, str(row["channel"])] = 1
-            continue
-
-        kept_rows.append(row)
-
-    return restored, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
 def run_tcn_split(
@@ -1636,14 +1601,14 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = extend_very_high_confidence_run_starts(
+    baseline_predictions = pad_extreme_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_run_points=60,
-        min_peak_ratio=30.0,
-        extra_pre_points=1,
+        max_run_points=2,
+        min_peak_ratio=12.0,
+        pad_points=1,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
@@ -1681,13 +1646,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_duration_mismatched_suppressions(
-        predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        memory_bank=memory_bank,
-        min_duration_ratio=4.0,
-        max_match_score=0.94,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
