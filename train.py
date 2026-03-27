@@ -597,12 +597,13 @@ class TcnAnomalyPipeline:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before vectorizing windows.")
         if len(windows) == 0:
-            embedding_dim = self.config.embedding_dim
+            embedding_dim = self.config.embedding_dim + (len(self.target_channels) * 3)
             return np.zeros((0, embedding_dim), dtype=np.float32)
 
         self.model.eval()
         batch_size = max(1, self.config.batch_size)
         embeddings: list[np.ndarray] = []
+        summary_features: list[np.ndarray] = []
 
         with torch.no_grad():
             for batch_start in range(0, len(windows), batch_size):
@@ -625,21 +626,28 @@ class TcnAnomalyPipeline:
                     base_features = np.concatenate([raw_normalized, dt_template, gap_template], axis=2).astype(np.float32)
                     mask_indicator = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
+                    window_summary_input = raw_normalized.astype(np.float32)
                 else:
                     model_inputs_list: list[np.ndarray] = []
+                    normalized_targets_list: list[np.ndarray] = []
                     for window in batch_windows:
                         padded = self._pad_or_trim_window(window)
-                        base_features, _ = self._transform_frame(padded)
+                        base_features, normalized_targets = self._transform_frame(padded)
                         mask_indicator = np.zeros((len(base_features), 1), dtype=np.float32)
                         model_inputs_list.append(np.concatenate([base_features, mask_indicator], axis=1))
+                        normalized_targets_list.append(normalized_targets)
                     model_inputs = np.asarray(model_inputs_list, dtype=np.float32)
+                    window_summary_input = np.asarray(normalized_targets_list, dtype=np.float32)
 
                 tensor = torch.from_numpy(np.asarray(model_inputs, dtype=np.float32)).float().to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     _, _, embedding = self.model(tensor)
                 embeddings.append(embedding.cpu().numpy().astype(np.float32))
+                summary_features.append(self._summarize_window_values(window_summary_input))
 
-        return np.concatenate(embeddings, axis=0)
+        combined = np.concatenate([np.concatenate(embeddings, axis=0), np.concatenate(summary_features, axis=0)], axis=1)
+        norms = np.linalg.norm(combined, axis=1, keepdims=True)
+        return np.divide(combined, np.maximum(norms, EPSILON), out=np.zeros_like(combined), where=norms > 0.0)
 
     def save(self, path: Path, metadata: dict[str, Any]) -> None:
         if self.model is None or self.scaler is None:
@@ -752,6 +760,14 @@ class TcnAnomalyPipeline:
             dt_std=float(max(dt_seconds.std(), EPSILON)),
             nominal_dt_seconds=float(np.median(positive_deltas)) if len(positive_deltas) > 0 else 0.0,
         )
+
+    def _summarize_window_values(self, window_values: np.ndarray) -> np.ndarray:
+        values = np.asarray(window_values, dtype=np.float32)
+        quarter = max(1, values.shape[1] // 4)
+        means = values.mean(axis=1)
+        stds = values.std(axis=1)
+        trend = values[:, -quarter:, :].mean(axis=1) - values[:, :quarter, :].mean(axis=1)
+        return np.concatenate([means, stds, trend], axis=1).astype(np.float32)
 
     def _transform_frame(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         assert self.scaler is not None
@@ -1292,57 +1308,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_supported_borderline_suppressions(
-    baseline_predictions: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    baseline_scores: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray | None,
-    support_padding: int,
-    min_other_channels: int,
-    min_peak_ratio: float,
-    max_match_score: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty or global_thresholds is None:
-        return gated_predictions, suppressed_events
-
-    restored = gated_predictions.copy()
-    threshold_lookup = {channel: float(global_thresholds[index]) for index, channel in enumerate(target_channels)}
-    kept_suppressions: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict("records"):
-        channel = str(row["channel"])
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        match_score = float(row["score"])
-        channel_threshold = threshold_lookup.get(channel, 0.0)
-        if channel_threshold <= 0.0 or match_score > max_match_score:
-            kept_suppressions.append(row)
-            continue
-
-        peak_score = float(baseline_scores.loc[start_time:end_time, channel].max())
-        if peak_score < (channel_threshold * min_peak_ratio):
-            kept_suppressions.append(row)
-            continue
-
-        window_start = max(0, restored.index.get_indexer([start_time], method="nearest")[0] - support_padding)
-        window_stop = min(len(restored.index), restored.index.get_indexer([end_time], method="nearest")[0] + support_padding + 1)
-        support_slice = restored.iloc[window_start:window_stop][target_channels].copy()
-        support_slice[channel] = 0
-        if int(support_slice.sum(axis=1).max()) < min_other_channels:
-            kept_suppressions.append(row)
-            continue
-
-        restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
-
-    if kept_suppressions:
-        filtered_suppressions = pd.DataFrame(kept_suppressions)
-    else:
-        filtered_suppressions = pd.DataFrame(columns=suppressed_events.columns)
-    return restored, filtered_suppressions
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1370,6 +1335,7 @@ def run_tcn_split(
         max_gap_points=8,
         support_padding=8,
     )
+
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1395,18 +1361,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_supported_borderline_suppressions(
-        baseline_predictions=baseline_predictions,
-        gated_predictions=gated_predictions,
-        baseline_scores=baseline_scores,
-        suppressed_events=suppressed_events,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        min_other_channels=1,
-        min_peak_ratio=1.35,
-        max_match_score=0.955,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
