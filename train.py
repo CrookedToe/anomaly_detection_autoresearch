@@ -1311,6 +1311,66 @@ def prune_weak_isolated_runs(
     return pruned
 
 
+def prune_noisy_channel_short_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    support_padding: int,
+    noisy_run_median_threshold: float,
+    noisy_peak_median_threshold: float,
+    min_run_points: int,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        runs: list[tuple[int, int, int, float]] = []
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max())))
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max())))
+
+        if not runs:
+            continue
+
+        median_run_length = float(np.median([run[2] for run in runs]))
+        median_peak_score = float(np.median([run[3] for run in runs]))
+        if median_run_length > noisy_run_median_threshold or median_peak_score > noisy_peak_median_threshold:
+            continue
+
+        for run_start, run_stop, run_length, _ in runs:
+            if run_length >= min_run_points:
+                continue
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = prediction_values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            if support.any():
+                continue
+            series[run_start:run_stop] = 0
+
+        pruned[channel] = series
+
+    return pruned
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1389,6 +1449,15 @@ def run_tcn_split(
         support_padding=8,
         peak_quantile=0.35,
         density_quantile=0.35,
+    )
+    baseline_predictions = prune_noisy_channel_short_runs(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        support_padding=8,
+        noisy_run_median_threshold=8.0,
+        noisy_peak_median_threshold=1.5,
+        min_run_points=8,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
