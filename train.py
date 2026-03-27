@@ -1438,7 +1438,7 @@ def apply_same_channel_memory_gating(
     memory_bank: RareNominalMemoryBank,
     half_window: int,
     metric: str,
-    threshold: float,
+    threshold: float | dict[str, float],
     vectorizer: Any | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
@@ -1449,6 +1449,7 @@ def apply_same_channel_memory_gating(
         if not channel_prototypes:
             continue
         channel_bank = RareNominalMemoryBank(channel_prototypes)
+        channel_threshold = float(threshold[channel]) if isinstance(threshold, dict) else float(threshold)
         channel_predictions = predictions.copy()
         for other_channel in target_channels:
             if other_channel != channel:
@@ -1460,7 +1461,7 @@ def apply_same_channel_memory_gating(
             memory_bank=channel_bank,
             half_window=half_window,
             metric=metric,
-            threshold=threshold,
+            threshold=channel_threshold,
             vectorizer=vectorizer,
         )
         gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
@@ -1472,6 +1473,33 @@ def apply_same_channel_memory_gating(
     else:
         suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
     return gated_predictions, suppressed_events
+
+
+def compute_channel_memory_thresholds(
+    memory_bank: RareNominalMemoryBank,
+    target_channels: list[str],
+    default_threshold: float,
+    metric: str,
+    minimum_threshold: float,
+) -> dict[str, float]:
+    thresholds = {channel: float(default_threshold) for channel in target_channels}
+    if metric != "cosine":
+        return thresholds
+
+    for channel in target_channels:
+        vectors = [prototype.vector for prototype in memory_bank.prototypes if prototype.channel == channel]
+        if len(vectors) < 2:
+            continue
+        matrix = np.asarray(vectors, dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        normalized = matrix / np.where(norms > 0.0, norms, 1.0)
+        similarities = normalized @ normalized.T
+        np.fill_diagonal(similarities, -np.inf)
+        nearest_neighbor_scores = np.max(similarities, axis=1)
+        adaptive_threshold = float(np.quantile(nearest_neighbor_scores, 0.25))
+        thresholds[channel] = min(float(default_threshold), max(float(minimum_threshold), adaptive_threshold))
+
+    return thresholds
 
 
 def run_tcn_split(
@@ -1545,6 +1573,13 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
+    channel_memory_thresholds = compute_channel_memory_thresholds(
+        memory_bank=memory_bank,
+        target_channels=args.target_channels,
+        default_threshold=resolved_args["memory_threshold"],
+        metric=args.metric,
+        minimum_threshold=0.90,
+    )
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
@@ -1553,7 +1588,7 @@ def run_tcn_split(
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
         metric=args.metric,
-        threshold=resolved_args["memory_threshold"],
+        threshold=channel_memory_thresholds,
         vectorizer=pipeline.vectorize_windows,
     )
 
@@ -1586,6 +1621,7 @@ def run_tcn_split(
             "half_window": resolved_args["half_window"],
             "metric": args.metric,
             "memory_threshold": resolved_args["memory_threshold"],
+            "channel_memory_thresholds": channel_memory_thresholds,
             "memory_size": len(memory_bank.prototypes),
             "config": asdict(tcn_config),
             "preset": args.tcn_preset,
