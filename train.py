@@ -991,7 +991,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_epochs": 4,
     "tcn_mask_ratio": 0.15,
     "tcn_train_stride": 8,
-    "tcn_inference_stride": 8,
+    "tcn_inference_stride": 4,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
