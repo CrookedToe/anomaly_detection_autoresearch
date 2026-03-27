@@ -1196,6 +1196,49 @@ def restore_long_suppressed_runs(
     return restored, filtered_suppressions
 
 
+def apply_same_channel_memory_gating(
+    frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    memory_bank: RareNominalMemoryBank,
+    half_window: int,
+    metric: str,
+    threshold: float,
+    vectorizer: Any | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    gated_predictions = predictions.copy()
+    suppressed_frames: list[pd.DataFrame] = []
+
+    for channel in target_channels:
+        channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
+        if not channel_prototypes:
+            continue
+        channel_bank = RareNominalMemoryBank(channel_prototypes)
+        channel_predictions = predictions.copy()
+        for other_channel in target_channels:
+            if other_channel != channel:
+                channel_predictions[other_channel] = 0
+        channel_gated, channel_suppressed = apply_memory_gating(
+            frame=frame,
+            predictions=channel_predictions,
+            target_channels=target_channels,
+            memory_bank=channel_bank,
+            half_window=half_window,
+            metric=metric,
+            threshold=threshold,
+            vectorizer=vectorizer,
+        )
+        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
+        if not channel_suppressed.empty:
+            suppressed_frames.append(channel_suppressed)
+
+    if suppressed_frames:
+        suppressed_events = pd.concat(suppressed_frames, ignore_index=True)
+    else:
+        suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
+    return gated_predictions, suppressed_events
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1228,7 +1271,7 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
