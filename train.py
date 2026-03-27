@@ -727,14 +727,18 @@ class TcnAnomalyPipeline:
         reconstruction_targets: torch.Tensor,
         reconstruction_mask: torch.Tensor,
     ) -> torch.Tensor:
-        forecast_loss = torch.mean((forecast - forecast_targets) ** 2)
+        forecast_loss = F.smooth_l1_loss(forecast, forecast_targets)
 
-        squared_error = (reconstruction - reconstruction_targets) ** 2
-        masked_error = squared_error * reconstruction_mask
+        reconstruction_error = F.smooth_l1_loss(
+            reconstruction,
+            reconstruction_targets,
+            reduction="none",
+        )
+        masked_error = reconstruction_error * reconstruction_mask
         if reconstruction_mask.sum() > 0:
             reconstruction_loss = masked_error.sum() / reconstruction_mask.sum()
         else:
-            reconstruction_loss = squared_error.mean()
+            reconstruction_loss = reconstruction_error.mean()
 
         return (
             self.config.forecast_loss_weight * forecast_loss
@@ -1249,53 +1253,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def split_runs_by_cross_channel_support(
-    predictions: pd.DataFrame,
-    target_channels: list[str],
-    support_padding: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    supported = predictions.copy()
-    unsupported = predictions.copy()
-    supported.loc[:, target_channels] = 0
-    unsupported.loc[:, target_channels] = 0
-    values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    supported_values = supported[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    unsupported_values = unsupported[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = values[:, channel_index]
-        run_start: int | None = None
-        for index, value in enumerate(series):
-            if value == 1 and run_start is None:
-                run_start = index
-                continue
-            if value == 1:
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            support_start = max(0, run_start - support_padding)
-            support_stop = min(len(series), run_stop + support_padding)
-            support = values[support_start:support_stop].copy()
-            support[:, channel_index] = 0
-            target = supported_values if support.any() else unsupported_values
-            target[run_start:run_stop, channel_index] = 1
-            run_start = None
-
-        if run_start is not None:
-            run_stop = len(series)
-            support_start = max(0, run_start - support_padding)
-            support = values[support_start:run_stop].copy()
-            support[:, channel_index] = 0
-            target = supported_values if support.any() else unsupported_values
-            target[run_start:run_stop, channel_index] = 1
-
-        supported[channel] = supported_values[:, channel_index]
-        unsupported[channel] = unsupported_values[:, channel_index]
-
-    return supported, unsupported
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1382,26 +1339,10 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
-    supported_predictions, unsupported_predictions = split_runs_by_cross_channel_support(
-        predictions=baseline_predictions,
-        target_channels=args.target_channels,
-        support_padding=8,
-    )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    supported_threshold = min(0.995, resolved_args["memory_threshold"] + 0.04)
-    gated_supported_predictions, supported_suppressed_events = apply_same_channel_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
-        predictions=supported_predictions,
-        target_channels=args.target_channels,
-        memory_bank=memory_bank,
-        half_window=resolved_args["half_window"],
-        metric=args.metric,
-        threshold=supported_threshold,
-        vectorizer=pipeline.vectorize_windows,
-    )
-    gated_unsupported_predictions, unsupported_suppressed_events = apply_same_channel_memory_gating(
-        frame=test_df,
-        predictions=unsupported_predictions,
+        predictions=baseline_predictions,
         target_channels=args.target_channels,
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
@@ -1409,17 +1350,6 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = baseline_predictions.copy()
-    gated_predictions.loc[:, args.target_channels] = np.maximum(
-        gated_supported_predictions[args.target_channels].to_numpy(dtype=np.uint8, copy=False),
-        gated_unsupported_predictions[args.target_channels].to_numpy(dtype=np.uint8, copy=False),
-    )
-    if not supported_suppressed_events.empty and not unsupported_suppressed_events.empty:
-        suppressed_events = pd.concat([supported_suppressed_events, unsupported_suppressed_events], ignore_index=True)
-    elif not supported_suppressed_events.empty:
-        suppressed_events = supported_suppressed_events
-    else:
-        suppressed_events = unsupported_suppressed_events
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
@@ -1450,7 +1380,6 @@ def run_tcn_split(
             "half_window": resolved_args["half_window"],
             "metric": args.metric,
             "memory_threshold": resolved_args["memory_threshold"],
-            "supported_memory_threshold": supported_threshold,
             "memory_size": len(memory_bank.prototypes),
             "config": asdict(tcn_config),
             "preset": args.tcn_preset,
