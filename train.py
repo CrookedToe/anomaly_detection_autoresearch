@@ -208,7 +208,6 @@ class TcnTrainingConfig:
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
-    strong_alert_score_scale: float = 1.5
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
     max_gap_fill: int = 2
@@ -991,7 +990,6 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
-    "tcn_strong_alert_score_scale": 1.5,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
     "tcn_max_gap_fill": 2,
@@ -1063,11 +1061,6 @@ def parse_args() -> argparse.Namespace:
         "--tcn-calibration-quantile",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_calibration_quantile"],
-    )
-    parser.add_argument(
-        "--tcn-strong-alert-score-scale",
-        type=float,
-        default=DEFAULT_TCN_ARGS["tcn_strong_alert_score_scale"],
     )
     parser.add_argument(
         "--tcn-score-smoothing-window",
@@ -1161,7 +1154,6 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
-        strong_alert_score_scale=resolved["tcn_strong_alert_score_scale"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
         max_gap_fill=resolved["tcn_max_gap_fill"],
@@ -1173,6 +1165,45 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         preload_max_gb=resolved["tcn_preload_max_gb"],
         training_wall_seconds=resolved["tcn_training_wall_seconds"],
     )
+
+
+def apply_same_channel_memory_gating(
+    frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    memory_bank: RareNominalMemoryBank,
+    half_window: int,
+    metric: str,
+    threshold: float,
+    vectorizer: Any | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    gated_predictions = predictions.copy()
+    suppressed_frames: list[pd.DataFrame] = []
+
+    for channel in target_channels:
+        channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
+        if not channel_prototypes:
+            continue
+        channel_bank = RareNominalMemoryBank(channel_prototypes)
+        channel_gated, channel_suppressed = apply_memory_gating(
+            frame=frame,
+            predictions=predictions[[channel]],
+            target_channels=[channel],
+            memory_bank=channel_bank,
+            half_window=half_window,
+            metric=metric,
+            threshold=threshold,
+            vectorizer=vectorizer,
+        )
+        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
+        if not channel_suppressed.empty:
+            suppressed_frames.append(channel_suppressed)
+
+    if suppressed_frames:
+        suppressed_events = pd.concat(suppressed_frames, ignore_index=True)
+    else:
+        suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
+    return gated_predictions, suppressed_events
 
 
 def run_tcn_split(
@@ -1206,15 +1237,8 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
-    strong_alerts = baseline_predictions.copy()
-    strong_alerts.loc[:, :] = 0
-    if pipeline.global_thresholds is not None:
-        for channel_index, channel in enumerate(args.target_channels):
-            strong_threshold = pipeline.global_thresholds[channel_index] * tcn_config.strong_alert_score_scale
-            strong_alerts[channel] = (baseline_scores[channel].to_numpy() >= strong_threshold).astype(np.uint8)
-
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
@@ -1224,7 +1248,6 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = ((gated_predictions > 0) | (strong_alerts > 0)).astype(np.uint8)
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
