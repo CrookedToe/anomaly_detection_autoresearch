@@ -1167,10 +1167,11 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
-def restore_multichannel_suppressed_runs(
+def restore_nonisolated_or_long_suppressed_runs(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
     suppressed_events: pd.DataFrame,
+    min_run_points: int,
     min_active_channels: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if suppressed_events.empty:
@@ -1183,8 +1184,10 @@ def restore_multichannel_suppressed_runs(
         channel = str(row["channel"])
         start_time = pd.Timestamp(row["start_time"])
         end_time = pd.Timestamp(row["end_time"])
-        concurrent_alerts = baseline_predictions.loc[start_time:end_time].sum(axis=1)
-        if not concurrent_alerts.empty and int(concurrent_alerts.max()) >= min_active_channels:
+        run_slice = baseline_predictions.loc[start_time:end_time]
+        run_length = int(run_slice[channel].sum())
+        concurrent_alerts = run_slice.sum(axis=1)
+        if run_length >= min_run_points or (not concurrent_alerts.empty and int(concurrent_alerts.max()) >= min_active_channels):
             restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
             continue
         kept_suppressions.append(row)
@@ -1238,10 +1241,11 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions, suppressed_events = restore_multichannel_suppressed_runs(
+    gated_predictions, suppressed_events = restore_nonisolated_or_long_suppressed_runs(
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
         suppressed_events=suppressed_events,
+        min_run_points=20,
         min_active_channels=2,
     )
 
