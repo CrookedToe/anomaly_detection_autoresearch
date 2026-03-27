@@ -593,11 +593,22 @@ class TcnAnomalyPipeline:
     def vectorize_window(self, window: pd.DataFrame) -> np.ndarray:
         return self.vectorize_windows([window])[0]
 
+    def _window_summary_features(self, raw_normalized_windows: np.ndarray) -> np.ndarray:
+        mean_features = raw_normalized_windows.mean(axis=1)
+        std_features = raw_normalized_windows.std(axis=1)
+        quarter = max(1, raw_normalized_windows.shape[1] // 4)
+        leading_mean = raw_normalized_windows[:, :quarter, :].mean(axis=1)
+        trailing_mean = raw_normalized_windows[:, -quarter:, :].mean(axis=1)
+        edge_delta = trailing_mean - leading_mean
+        summary = np.concatenate([mean_features, std_features, edge_delta], axis=1).astype(np.float32)
+        norm = np.linalg.norm(summary, axis=1, keepdims=True)
+        return summary / np.maximum(norm, EPSILON)
+
     def vectorize_windows(self, windows: list[pd.DataFrame] | np.ndarray) -> np.ndarray:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before vectorizing windows.")
         if len(windows) == 0:
-            embedding_dim = self.config.embedding_dim
+            embedding_dim = self.config.embedding_dim + (3 * len(self.target_channels))
             return np.zeros((0, embedding_dim), dtype=np.float32)
 
         self.model.eval()
@@ -627,17 +638,24 @@ class TcnAnomalyPipeline:
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
                 else:
                     model_inputs_list: list[np.ndarray] = []
+                    raw_normalized_list: list[np.ndarray] = []
                     for window in batch_windows:
                         padded = self._pad_or_trim_window(window)
                         base_features, _ = self._transform_frame(padded)
+                        raw_normalized_list.append(base_features[:, : len(self.target_channels)].copy())
                         mask_indicator = np.zeros((len(base_features), 1), dtype=np.float32)
                         model_inputs_list.append(np.concatenate([base_features, mask_indicator], axis=1))
                     model_inputs = np.asarray(model_inputs_list, dtype=np.float32)
+                    raw_normalized = np.asarray(raw_normalized_list, dtype=np.float32)
 
                 tensor = torch.from_numpy(np.asarray(model_inputs, dtype=np.float32)).float().to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     _, _, embedding = self.model(tensor)
-                embeddings.append(embedding.cpu().numpy().astype(np.float32))
+                embedding_values = embedding.cpu().numpy().astype(np.float32)
+                summary_features = self._window_summary_features(raw_normalized)
+                combined_embedding = np.concatenate([embedding_values, summary_features], axis=1).astype(np.float32)
+                combined_norm = np.linalg.norm(combined_embedding, axis=1, keepdims=True)
+                embeddings.append(combined_embedding / np.maximum(combined_norm, EPSILON))
 
         return np.concatenate(embeddings, axis=0)
 
@@ -1506,71 +1524,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def reconnect_memory_split_runs(
-    predictions: pd.DataFrame,
-    baseline_predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    max_gap_points: int,
-    min_gap_score_ratio: float,
-    min_edge_peak_ratio: float,
-) -> pd.DataFrame:
-    repaired = predictions.copy()
-    repaired_values = repaired[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = repaired_values[:, channel_index].copy()
-        baseline_series = baseline_values[:, channel_index]
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            left_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            left_stop = index
-
-            gap_start = left_stop
-            while index < len(series) and series[index] == 0:
-                index += 1
-            gap_stop = index
-            gap_length = gap_stop - gap_start
-
-            if gap_length == 0 or gap_length > max_gap_points or gap_stop >= len(series):
-                continue
-            if not np.all(baseline_series[gap_start:gap_stop] == 1):
-                continue
-
-            right_start = gap_stop
-            while index < len(series) and series[index] == 1:
-                index += 1
-            right_stop = index
-
-            left_peak = float(channel_scores[left_start:left_stop].max())
-            right_peak = float(channel_scores[right_start:right_stop].max())
-            gap_peak = float(channel_scores[gap_start:gap_stop].max())
-
-            if max(left_peak, right_peak) < (threshold * min_edge_peak_ratio):
-                continue
-            if gap_peak < (threshold * min_gap_score_ratio):
-                continue
-
-            series[gap_start:gap_stop] = 1
-
-        repaired[channel] = series
-
-    return repaired
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1658,16 +1611,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions = reconnect_memory_split_runs(
-        predictions=gated_predictions,
-        baseline_predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_gap_points=2,
-        min_gap_score_ratio=0.92,
-        min_edge_peak_ratio=1.08,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
