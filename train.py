@@ -828,7 +828,7 @@ class TcnAnomalyPipeline:
                 min_periods=1,
             ).max()
             smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
-            threshold_source = smoothed_series.shift(1)
+            threshold_source = rolling_mean.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
@@ -1249,110 +1249,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def prune_low_margin_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray | None,
-    support_padding: int,
-    min_peak_margin: float,
-    min_mean_margin: float,
-    keep_long_run_points: int,
-) -> pd.DataFrame:
-    if global_thresholds is None:
-        return predictions
-
-    pruned = predictions.copy()
-    values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        base_threshold = float(global_thresholds[channel_index])
-        if base_threshold <= 0.0:
-            continue
-
-        series = values[:, channel_index].copy()
-        channel_scores = scores[channel].to_numpy(dtype=np.float32, copy=False)
-        run_start: int | None = None
-        for index, value in enumerate(series):
-            if value == 1 and run_start is None:
-                run_start = index
-                continue
-            if value == 1:
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            series = _maybe_prune_run_by_margin(
-                series=series,
-                values=values,
-                channel_index=channel_index,
-                channel_scores=channel_scores,
-                run_start=run_start,
-                run_stop=run_stop,
-                base_threshold=base_threshold,
-                support_padding=support_padding,
-                min_peak_margin=min_peak_margin,
-                min_mean_margin=min_mean_margin,
-                keep_long_run_points=keep_long_run_points,
-            )
-            run_start = None
-
-        if run_start is not None:
-            series = _maybe_prune_run_by_margin(
-                series=series,
-                values=values,
-                channel_index=channel_index,
-                channel_scores=channel_scores,
-                run_start=run_start,
-                run_stop=len(series),
-                base_threshold=base_threshold,
-                support_padding=support_padding,
-                min_peak_margin=min_peak_margin,
-                min_mean_margin=min_mean_margin,
-                keep_long_run_points=keep_long_run_points,
-            )
-        pruned[channel] = series
-
-    return pruned
-
-
-def _maybe_prune_run_by_margin(
-    series: np.ndarray,
-    values: np.ndarray,
-    channel_index: int,
-    channel_scores: np.ndarray,
-    run_start: int,
-    run_stop: int,
-    base_threshold: float,
-    support_padding: int,
-    min_peak_margin: float,
-    min_mean_margin: float,
-    keep_long_run_points: int,
-) -> np.ndarray:
-    run_length = run_stop - run_start
-    if run_length >= keep_long_run_points:
-        return series
-
-    support_start = max(0, run_start - support_padding)
-    support_stop = min(len(series), run_stop + support_padding)
-    support = values[support_start:support_stop].copy()
-    support[:, channel_index] = 0
-    if support.any():
-        return series
-
-    run_scores = channel_scores[run_start:run_stop]
-    if run_scores.size == 0:
-        return series
-
-    peak_score = float(np.max(run_scores))
-    mean_score = float(np.mean(run_scores))
-    if peak_score >= (base_threshold * min_peak_margin) and mean_score >= (base_threshold * min_mean_margin):
-        return series
-
-    series[run_start:run_stop] = 0
-    return series
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1422,16 +1318,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         max_gap_points=8,
         support_padding=8,
-    )
-    baseline_predictions = prune_low_margin_runs(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        min_peak_margin=1.15,
-        min_mean_margin=1.03,
-        keep_long_run_points=32,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
