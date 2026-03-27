@@ -1249,39 +1249,66 @@ def merge_supported_close_runs(
     return merged
 
 
-def restore_weak_long_memory_suppressions(
-    original_predictions: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    channel: str,
-    min_duration_seconds: float,
-    min_score: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
+def _l2_normalize_rows(vectors: np.ndarray) -> np.ndarray:
+    array = np.asarray(vectors, dtype=np.float32)
+    if len(array) == 0:
+        return array.astype(np.float32)
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    safe_norms = np.where(norms > EPSILON, norms, 1.0)
+    return (array / safe_norms).astype(np.float32)
 
-    restored_predictions = gated_predictions.copy()
-    kept_events: list[dict[str, Any]] = []
-    restored_count = 0
 
-    for row in suppressed_events.to_dict("records"):
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
-        score = float(row["score"])
-        if duration_seconds >= min_duration_seconds and score < min_score:
-            restored_predictions.loc[start_time:end_time, channel] = original_predictions.loc[start_time:end_time, channel]
-            restored_count += 1
-            continue
-        kept_events.append(row)
+def build_context_memory_vectors(
+    windows: list[pd.DataFrame] | np.ndarray,
+    target_channels: list[str],
+    pad_or_trim_window: Any,
+) -> np.ndarray:
+    if isinstance(windows, np.ndarray):
+        window_values = np.asarray(windows, dtype=np.float32)
+    else:
+        padded_windows: list[np.ndarray] = []
+        for window in windows:
+            padded = pad_or_trim_window(window)
+            padded_windows.append(padded[target_channels].to_numpy(dtype=np.float32, copy=True))
+        if not padded_windows:
+            return np.zeros((0, 0), dtype=np.float32)
+        window_values = np.asarray(padded_windows, dtype=np.float32)
 
-    if restored_count > 0:
-        log_debug(
-            f"[memory] restored channel={channel} weak_long_suppressions={restored_count} "
-            f"min_duration_seconds={min_duration_seconds:.0f} min_score={min_score:.3f}"
+    if len(window_values) == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    first_diff = np.diff(window_values, axis=1, prepend=window_values[:, :1, :])
+    return np.concatenate(
+        [
+            window_values.mean(axis=1),
+            window_values.std(axis=1),
+            window_values.min(axis=1),
+            window_values.max(axis=1),
+            window_values[:, 0, :],
+            window_values[:, -1, :],
+            first_diff.mean(axis=1),
+            first_diff.std(axis=1),
+            np.max(np.abs(first_diff), axis=1),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+def hybrid_memory_vectorize_windows(
+    pipeline: TcnAnomalyPipeline,
+    windows: list[pd.DataFrame] | np.ndarray,
+) -> np.ndarray:
+    learned_vectors = _l2_normalize_rows(pipeline.vectorize_windows(windows))
+    context_vectors = _l2_normalize_rows(
+        build_context_memory_vectors(
+            windows=windows,
+            target_channels=pipeline.target_channels,
+            pad_or_trim_window=pipeline._pad_or_trim_window,
         )
-
-    return restored_predictions, pd.DataFrame(kept_events, columns=suppressed_events.columns)
+    )
+    if context_vectors.shape[1] == 0:
+        return learned_vectors
+    return np.concatenate([learned_vectors, 0.5 * context_vectors], axis=1).astype(np.float32)
 
 
 def apply_same_channel_memory_gating(
@@ -1296,8 +1323,6 @@ def apply_same_channel_memory_gating(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
     suppressed_frames: list[pd.DataFrame] = []
-    long_run_restore_seconds = 600.0
-    long_run_restore_score = threshold + 0.02
 
     for channel in target_channels:
         channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
@@ -1317,14 +1342,6 @@ def apply_same_channel_memory_gating(
             metric=metric,
             threshold=threshold,
             vectorizer=vectorizer,
-        )
-        channel_gated, channel_suppressed = restore_weak_long_memory_suppressions(
-            original_predictions=predictions,
-            gated_predictions=channel_gated,
-            suppressed_events=channel_suppressed,
-            channel=channel,
-            min_duration_seconds=long_run_restore_seconds,
-            min_score=long_run_restore_score,
         )
         gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
         if not channel_suppressed.empty:
@@ -1349,6 +1366,7 @@ def run_tcn_split(
     tcn_config = build_tcn_config(args, split)
     pipeline = TcnAnomalyPipeline(target_channels=args.target_channels, config=tcn_config)
     training_summary = pipeline.fit(train_df)
+    memory_vectorizer = lambda windows: hybrid_memory_vectorize_windows(pipeline, windows)
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
@@ -1378,7 +1396,7 @@ def run_tcn_split(
         labels=train_labels,
         target_channels=args.target_channels,
         half_window=resolved_args["half_window"],
-        vectorizer=pipeline.vectorize_windows,
+        vectorizer=memory_vectorizer,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
@@ -1389,7 +1407,7 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
-        vectorizer=pipeline.vectorize_windows,
+        vectorizer=memory_vectorizer,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
