@@ -500,7 +500,6 @@ class TcnAnomalyPipeline:
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
-        horizon_weights_np = np.linspace(1.0, 0.4, self.config.horizon, dtype=np.float32)
 
         batch_size = self.config.batch_size
         with torch.no_grad():
@@ -519,7 +518,6 @@ class TcnAnomalyPipeline:
                     ).float()
 
                 if self.cp is not None:
-                    horizon_weights = self.cp.asarray(horizon_weights_np, dtype=self.cp.float32)
                     forecast_error = self.cp.from_dlpack(forecast_error_t)
                     reconstruction_error = self.cp.from_dlpack(reconstruction_error_t)
                     anchor_indices = self.cp.asarray(batch_indices + self.config.sequence_length - 1, dtype=self.cp.int64)
@@ -535,12 +533,12 @@ class TcnAnomalyPipeline:
                         self.cp.add.at(
                             forecast_sum[:, channel_index],
                             future_indices[valid_mask],
-                            (forecast_error[:, :, channel_index] * horizon_weights[None, :])[valid_mask],
+                            forecast_error[:, :, channel_index][valid_mask],
                         )
                         self.cp.add.at(
                             forecast_count[:, channel_index],
                             future_indices[valid_mask],
-                            self.cp.broadcast_to(horizon_weights[None, :], future_indices.shape)[valid_mask],
+                            1.0,
                         )
                 else:
                     forecast_error = forecast_error_t.cpu().numpy()
@@ -557,9 +555,8 @@ class TcnAnomalyPipeline:
                         for horizon_offset, future_index in enumerate(future_indices):
                             if future_index >= n_rows:
                                 break
-                            weight = float(horizon_weights_np[horizon_offset])
-                            forecast_sum[future_index] += forecast_error[row_index, horizon_offset] * weight
-                            forecast_count[future_index] += weight
+                            forecast_sum[future_index] += forecast_error[row_index, horizon_offset]
+                            forecast_count[future_index] += 1.0
 
         if self.cp is not None:
             forecast_scores = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
@@ -1402,6 +1399,49 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
+def extend_strong_short_run_tails(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    min_peak_ratio: float,
+    post_points: int,
+) -> pd.DataFrame:
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            run_length = run_stop - run_start
+            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+            if run_length > max_run_points or run_peak_ratio < min_peak_ratio:
+                continue
+
+            extend_stop = min(len(series), run_stop + max(0, post_points))
+            series[run_stop:extend_stop] = 1
+
+        extended[channel] = series
+
+    return extended
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1559,6 +1599,15 @@ def run_tcn_split(
         target_channels=args.target_channels,
         pre_points=1,
         post_points=0,
+    )
+    baseline_predictions = extend_strong_short_run_tails(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        max_run_points=6,
+        min_peak_ratio=1.6,
+        post_points=1,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
