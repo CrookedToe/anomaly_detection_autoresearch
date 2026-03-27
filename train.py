@@ -1032,7 +1032,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tol", type=float, default=5.0, help="STD threshold multiplier.")
     parser.add_argument("--half-window", type=int, default=64, help="Half-window size for memory matching.")
     parser.add_argument("--metric", choices=["cosine", "euclidean"], default="cosine")
-    parser.add_argument("--memory-threshold", type=float, default=0.92)
+    parser.add_argument("--memory-threshold", type=float, default=DEFAULT_MEMORY_ARGS["memory_threshold"])
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--results-root", type=Path, default=Path("results/mission1_subset"))
     parser.add_argument("--tcn-preset", choices=["none", *TCN_PRESETS.keys()], default="none")
