@@ -1167,24 +1167,32 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
-def restore_long_suppressed_runs(
+def restore_confident_suppressed_runs(
+    baseline_scores: pd.DataFrame,
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
     suppressed_events: pd.DataFrame,
-    min_run_points: int,
+    target_channels: list[str],
+    global_thresholds: np.ndarray | None,
+    score_scale: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
+    if suppressed_events.empty or global_thresholds is None:
         return gated_predictions, suppressed_events
 
     restored = gated_predictions.copy()
     kept_suppressions: list[dict[str, Any]] = []
+    threshold_lookup = {channel: float(global_thresholds[index]) for index, channel in enumerate(target_channels)}
 
     for row in suppressed_events.to_dict("records"):
         channel = str(row["channel"])
         start_time = pd.Timestamp(row["start_time"])
         end_time = pd.Timestamp(row["end_time"])
-        run_length = int(baseline_predictions.loc[start_time:end_time, channel].sum())
-        if run_length >= min_run_points:
+        run_scores = baseline_scores.loc[start_time:end_time, channel]
+        if run_scores.empty:
+            kept_suppressions.append(row)
+            continue
+        peak_score = float(run_scores.max())
+        if peak_score >= (threshold_lookup[channel] * score_scale):
             restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
             continue
         kept_suppressions.append(row)
@@ -1194,49 +1202,6 @@ def restore_long_suppressed_runs(
     else:
         filtered_suppressions = pd.DataFrame(columns=suppressed_events.columns)
     return restored, filtered_suppressions
-
-
-def apply_same_channel_memory_gating(
-    frame: pd.DataFrame,
-    predictions: pd.DataFrame,
-    target_channels: list[str],
-    memory_bank: RareNominalMemoryBank,
-    half_window: int,
-    metric: str,
-    threshold: float,
-    vectorizer: Any | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    gated_predictions = predictions.copy()
-    suppressed_frames: list[pd.DataFrame] = []
-
-    for channel in target_channels:
-        channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
-        if not channel_prototypes:
-            continue
-        channel_bank = RareNominalMemoryBank(channel_prototypes)
-        channel_predictions = predictions.copy()
-        for other_channel in target_channels:
-            if other_channel != channel:
-                channel_predictions[other_channel] = 0
-        channel_gated, channel_suppressed = apply_memory_gating(
-            frame=frame,
-            predictions=channel_predictions,
-            target_channels=target_channels,
-            memory_bank=channel_bank,
-            half_window=half_window,
-            metric=metric,
-            threshold=threshold,
-            vectorizer=vectorizer,
-        )
-        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
-        if not channel_suppressed.empty:
-            suppressed_frames.append(channel_suppressed)
-
-    if suppressed_frames:
-        suppressed_events = pd.concat(suppressed_frames, ignore_index=True)
-    else:
-        suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
-    return gated_predictions, suppressed_events
 
 
 def run_tcn_split(
@@ -1271,7 +1236,7 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
+    gated_predictions, suppressed_events = apply_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
@@ -1281,11 +1246,14 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions, suppressed_events = restore_long_suppressed_runs(
+    gated_predictions, suppressed_events = restore_confident_suppressed_runs(
+        baseline_scores=baseline_scores,
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
         suppressed_events=suppressed_events,
-        min_run_points=20,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        score_scale=1.5,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
