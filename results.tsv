@@ -1,0 +1,113 @@
+commit	primary_f05	status	description
+0f5ef88	0.165957	keep	baseline mar26 setup
+a557b29	0.155624	discard	hysteresis thresholding
+ced15cf	0.174653	keep	increase default alert gap fill
+ca5c49a	0.174653	discard	raise threshold calibration floor
+b710f6d	0.118678	discard	reduce default forecast horizon
+c1c59ce	0.203021	keep	reduce default dropout
+abb522e	0.248417	keep	lower default learning rate
+c72a8a3	0.248417	discard	lower default weight decay
+e940ff3	0.217364	discard	reduce reconstruction score weight
+65d5c57	0.000000	crash	protect strong alerts from memory gating
+b905f7b	0.000000	crash	restrict memory gating to same-channel prototypes
+7d3516a	0.242394	discard	restrict memory gating to same-channel prototypes
+46b8968	0.248415	discard	gate only short alert runs with memory
+7f24b3d	0.242392	discard	combine same-channel and short-run memory gating
+495313a	0.106080	discard	restore strong detector runs after memory gating
+4d1bf5a	0.225957	discard	restore multi-channel runs after memory gating
+6eeae6c	0.225957	discard	gate only short isolated runs with memory
+1c66438	0.228730	discard	add score agreement bonus
+2cba306	0.248415	discard	rerun short-run memory gating validation
+541ecd3	0.101761	discard	use handcrafted vectors for memory gating
+dcec851	0.254746	keep	prune short isolated baseline runs
+e1b2cf4	0.254744	discard	combine baseline pruning with short-run memory gating
+ba79cf4	0.254746	keep	combine baseline pruning with same-channel memory gating
+b55621a	0.254744	discard	restore long same-channel gated runs
+1bec33e	0.242394	discard	keep strong isolated baseline runs
+0b04537	0.300716	keep	merge supported same-channel gaps
+7d58e96	0.000000	crash	skip gating on supported runs
+b69e410	0.275823	discard	skip gating on supported runs retry
+ed04a5e	0.300716	discard	trim unsupported run edges
+fed1b1f	0.300714	discard	gate only short runs after merge
+0133a16	0.310039	keep	use peak-preserving score smoothing
+66154bb	0.016783	discard	decouple threshold from peak smoothing
+6246500	0.000000	crash	stuck resume loop on raise min run length after peak smoothing
+69bade7	0.000000	crash	stuck resume loop on combine peak smoothing with short-run gating
+9da285b	0.000000	crash	stuck resume loop on skip gating on very strong runs
+9d520ad	0.310039	discard	prune low-margin unsupported runs
+89e3465	0.000000	crash	stuck resume loop on extend supported run edges
+4e9a186	0.310039	discard	restore supported borderline suppressions
+3887bfb	0.000000	crash	augment memory vectors with shape stats
+d6576ef	0.000000	crash	require stronger support for short run merges
+5745699	0.000000	crash	use max-dominant score fusion
+9c2690c	0.000000	crash	add rolling quantile threshold floor
+f373273	0.291934	discard	calibrate component-wise score fusion
+55b036a	0.000000	crash	extend supported anomaly shoulders
+88a0424	0.077350	discard	add delta telemetry features
+a950b17	0.000000	crash	use trained pooled encoder memory vectors
+2f77117	0.000000	crash	infrastructure crash on threshold hysteresis continuation
+380566c	0.302987	discard	promote supported near-threshold points
+f1de132	0.000000	crash	infrastructure crash on bridge supported near-threshold gaps
+d3020c8	0.310039	discard	restore weak long memory suppressions
+d60135d	0.000000	crash	use hybrid memory context vectors
+69f830f	0.144503	discard	normalize component scores before fusion
+7455ce5	0.000000	crash	use support-aware memory thresholds
+787b7df	0.310039	discard	use smooth l1 tcn losses
+7786dee	0.000000	crash	score reconstruction over a short tail
+c091f7c	0.310039	keep	prune weak isolated score runs
+ddd0191	0.891353	keep	extend confident anomaly shoulders
+e46f97b	0.000000	crash	preserve strong short score runs
+989444e	0.891353	discard	repair tiny gaps after memory gating
+53bfc52	0.815468	discard	gate only short runs with memory
+40c2afa	0.000000	crash	infrastructure crash on restore high-confidence gated runs
+78bebc5	0.891354	keep	re-prune weak noisy channels after shoulder extension
+335efac	0.000000	crash	infrastructure crash on restore cross-channel-supported suppressions
+d59e2f7	0.891353	discard	prune fragmented noisy channels
+fac285a	0.891353	discard	relax memory gating for weak runs
+bb02e8a	0.000000	crash	infrastructure crash on blend memory embeddings with summary stats
+fa1ded4	0.891353	discard	prune unsupported low-margin shoulder extensions
+88668ad	0.891353	discard	use temporal rare-event memory prototypes
+0b5cd7d	0.000000	crash	use channel-specific memory thresholds
+21922c1	0.891353	discard	bridge confident intra-channel score gaps
+86f45c9	0.968860	keep	backfill detector run starts by one sample
+f026b10	0.000000	crash	infrastructure crash on prune supported hitchhiker runs
+bc6a496	0.000000	crash	infrastructure crash on expand detector runs by one sample on both sides
+c393436	0.968854	discard	extend supported detector run tails
+2f3eabb	0.968860	discard	restore very long gated runs
+743fe1a	0.092555	discard	restore supported latent score runs
+1351ad8	0.968860	discard	prune short low-margin memory runs
+e74b488	0.000000	crash	infrastructure crash on extend strong run starts by one more sample
+5277163	0.000000	crash	restore consensus-supported score windows
+51b5157	0.939705	discard	restore supported raw detector runs
+e10bf7e	0.000000	crash	infrastructure crash on prune reactivated hitchhiker runs
+3c330c7	0.968860	discard	restore strong near-threshold suppressions
+620d72e	0.000000	crash	infrastructure crash on lower adaptive threshold std factor
+6d60d44	0.968859	discard	backfill consensus-supported run starts
+622e53f	0.968860	discard	extend strong short run tails
+3bb5c2c	0.968860	discard	restore extreme consensus spikes
+312ad87	0.000000	crash	lead-compensate strong score peaks
+642152f	0.824104	discard	cap adaptive threshold history
+e38570c	0.968853	discard	boost sustained score drift
+bbaca65	0.968860	discard	densify inference overlap
+8617394	0.000000	crash	infrastructure crash on maximize inference overlap
+6f65635	0.968860	discard	prune short low-margin residual runs
+654a2cd	0.968858	discard	restore high-margin low-sim suppressions
+b529e43	0.000000	crash	infrastructure crash on pre-extend very strong run starts
+3e73cd8	0.968858	discard	extend supported detector run starts
+fd7c50b	0.968860	discard	pad extreme short runs
+64c8453	0.488051	discard	restore consensus score windows
+0a5391a	0.968860	discard	prune weak long gated runs
+8cadc71	0.368207	discard	rescue synchronized score onsets
+02e202b	0.968860	discard	restore duration-mismatched suppressions
+08799a7	0.000000	crash	infrastructure crash on pad supported run boundaries
+46b475f	0.968860	discard	blend forecast peak into score aggregation
+90b2591	0.751330	discard	restore strong short runs removed by cleanup
+9e45214	0.000000	crash	infrastructure crash on tighten memory gating on weak isolated runs
+94bfd61	0.968860	discard	peak-center same-channel memory queries
+747f185	0.000000	crash	extend strong run starts by score
+e21d501	0.968854	discard	backfill supported multichannel onsets
+74a7075	0.000000	crash	restore ultra-long suppressed runs
+7aaff9d	0.968860	discard	prune residual short ungated runs
+91d04ba	0.000000	crash	bridge short global event gaps
+e9f96d5	0.179281	discard	restore synchronized score segments
+219e008	0.000000	crash	infrastructure crash on lower thresholds on multichannel support

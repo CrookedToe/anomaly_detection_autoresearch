@@ -816,8 +816,6 @@ class TcnAnomalyPipeline:
     def _dynamic_threshold(self, scores: pd.DataFrame) -> pd.DataFrame:
         thresholded = pd.DataFrame(index=scores.index)
         global_thresholds = self.global_thresholds if self.global_thresholds is not None else np.zeros(len(self.target_channels))
-        smoothed_values = np.zeros((len(scores), len(self.target_channels)), dtype=np.float32)
-        threshold_values = np.zeros((len(scores), len(self.target_channels)), dtype=np.float32)
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
@@ -840,21 +838,8 @@ class TcnAnomalyPipeline:
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
-            threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index]).astype(
-                np.float32
-            )
-            smoothed_values[:, channel_index] = smoothed_series.to_numpy(dtype=np.float32, copy=True)
-            threshold_values[:, channel_index] = threshold.to_numpy(dtype=np.float32, copy=True)
-
-        support_active = smoothed_values >= (threshold_values * 0.98)
-
-        for channel_index, channel in enumerate(self.target_channels):
-            support_counts = support_active.sum(axis=1) - support_active[:, channel_index].astype(np.int32)
-            adjusted_threshold = threshold_values[:, channel_index].copy()
-            supported = support_counts >= 2
-            supported_floor = max(float(global_thresholds[channel_index]) * 0.96, EPSILON)
-            adjusted_threshold[supported] = np.maximum(adjusted_threshold[supported] * 0.96, supported_floor)
-            raw_prediction = (smoothed_values[:, channel_index] > adjusted_threshold).astype(np.uint8)
+            threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
+            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
@@ -1521,6 +1506,71 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def reconnect_memory_split_runs(
+    predictions: pd.DataFrame,
+    baseline_predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_gap_points: int,
+    min_gap_score_ratio: float,
+    min_edge_peak_ratio: float,
+) -> pd.DataFrame:
+    repaired = predictions.copy()
+    repaired_values = repaired[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = repaired_values[:, channel_index].copy()
+        baseline_series = baseline_values[:, channel_index]
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            left_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            left_stop = index
+
+            gap_start = left_stop
+            while index < len(series) and series[index] == 0:
+                index += 1
+            gap_stop = index
+            gap_length = gap_stop - gap_start
+
+            if gap_length == 0 or gap_length > max_gap_points or gap_stop >= len(series):
+                continue
+            if not np.all(baseline_series[gap_start:gap_stop] == 1):
+                continue
+
+            right_start = gap_stop
+            while index < len(series) and series[index] == 1:
+                index += 1
+            right_stop = index
+
+            left_peak = float(channel_scores[left_start:left_stop].max())
+            right_peak = float(channel_scores[right_start:right_stop].max())
+            gap_peak = float(channel_scores[gap_start:gap_stop].max())
+
+            if max(left_peak, right_peak) < (threshold * min_edge_peak_ratio):
+                continue
+            if gap_peak < (threshold * min_gap_score_ratio):
+                continue
+
+            series[gap_start:gap_stop] = 1
+
+        repaired[channel] = series
+
+    return repaired
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1608,6 +1658,16 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = reconnect_memory_split_runs(
+        predictions=gated_predictions,
+        baseline_predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        max_gap_points=2,
+        min_gap_score_ratio=0.92,
+        min_edge_peak_ratio=1.08,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
