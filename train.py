@@ -207,6 +207,7 @@ class TcnTrainingConfig:
     reconstruction_score_weight: float = 0.35
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
+    threshold_hysteresis_factor: float = 0.5
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
@@ -832,12 +833,38 @@ class TcnAnomalyPipeline:
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
-            dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
+            robust_scale = 1.4826 * rolling_mad.fillna(0.0)
+            dynamic_threshold = rolling_median + (self.config.threshold_std_factor * robust_scale)
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
+            continuation_threshold = np.maximum(
+                threshold - (self.config.threshold_hysteresis_factor * robust_scale),
+                global_thresholds[channel_index],
+            )
+            raw_prediction = self._hysteresis_threshold(
+                scores=smoothed_series.to_numpy(dtype=np.float32, copy=True),
+                start_threshold=threshold.to_numpy(dtype=np.float32, copy=True),
+                continuation_threshold=continuation_threshold.to_numpy(dtype=np.float32, copy=True),
+            )
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
+
+    def _hysteresis_threshold(
+        self,
+        scores: np.ndarray,
+        start_threshold: np.ndarray,
+        continuation_threshold: np.ndarray,
+    ) -> np.ndarray:
+        predictions = np.zeros(len(scores), dtype=np.uint8)
+        active = False
+        for index, score in enumerate(scores):
+            threshold = continuation_threshold[index] if active else start_threshold[index]
+            if score > threshold:
+                predictions[index] = 1
+                active = True
+            else:
+                active = False
+        return predictions
 
     def _postprocess_prediction_runs(self, predictions: np.ndarray) -> np.ndarray:
         processed = np.asarray(predictions, dtype=np.uint8).copy()
@@ -989,6 +1016,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
+    "tcn_threshold_hysteresis_factor": 0.5,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
@@ -1017,6 +1045,7 @@ TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "tcn_train_stride": 16,
             "tcn_inference_stride": 64,
             "tcn_threshold_std_factor": 5.0,
+            "tcn_threshold_hysteresis_factor": 0.75,
             "tcn_calibration_quantile": 0.999,
             "half_window": 32,
             "memory_threshold": 0.92,
@@ -1056,6 +1085,11 @@ def parse_args() -> argparse.Namespace:
         "--tcn-threshold-std-factor",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_threshold_std_factor"],
+    )
+    parser.add_argument(
+        "--tcn-threshold-hysteresis-factor",
+        type=float,
+        default=DEFAULT_TCN_ARGS["tcn_threshold_hysteresis_factor"],
     )
     parser.add_argument(
         "--tcn-calibration-quantile",
@@ -1153,6 +1187,7 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         inference_stride=resolved["tcn_inference_stride"],
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
+        threshold_hysteresis_factor=resolved["tcn_threshold_hysteresis_factor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
