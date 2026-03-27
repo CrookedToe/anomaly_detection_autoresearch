@@ -208,6 +208,9 @@ class TcnTrainingConfig:
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
+    score_smoothing_window: int = 5
+    min_anomaly_run_length: int = 5
+    max_gap_fill: int = 1
     validation_fraction: float = 0.1
     random_seed: int = 42
     device: str = "cuda"
@@ -606,9 +609,12 @@ class TcnAnomalyPipeline:
                 batch_windows = windows[batch_start : batch_start + batch_size]
                 if isinstance(batch_windows, np.ndarray):
                     window_values = np.asarray(batch_windows, dtype=np.float32)
+                    if np.isnan(window_values).any():
+                        fill_values = self.scaler.raw_mean.reshape(1, 1, -1)
+                        window_values = np.where(np.isnan(window_values), fill_values, window_values)
                     flattened = window_values.reshape(-1, window_values.shape[-1])
                     raw_normalized = ((flattened - self.scaler.raw_mean) / self.scaler.raw_std).reshape(window_values.shape)
-                    range_dt_seconds = np.float32(1e-9)
+                    range_dt_seconds = np.float32(self.scaler.nominal_dt_seconds)
                     normalized_dt_value = np.float32((range_dt_seconds - self.scaler.dt_mean) / self.scaler.dt_std)
                     dt_template = np.full(
                         (len(window_values), window_values.shape[1], 1),
@@ -813,16 +819,59 @@ class TcnAnomalyPipeline:
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
-            rolling_median = series.rolling(self.config.threshold_window, min_periods=max(16, self.config.threshold_window // 8)).median()
-            rolling_mad = (series - rolling_median).abs().rolling(
+            smoothed_series = series.rolling(
+                self.config.score_smoothing_window,
+                min_periods=1,
+            ).mean()
+            threshold_source = smoothed_series.shift(1)
+            rolling_median = threshold_source.rolling(
+                self.config.threshold_window,
+                min_periods=max(16, self.config.threshold_window // 8),
+            ).median()
+            rolling_mad = (threshold_source - rolling_median).abs().rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            thresholded[channel] = (series > threshold).astype(np.uint8)
+            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
+            thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
+
+    def _postprocess_prediction_runs(self, predictions: np.ndarray) -> np.ndarray:
+        processed = np.asarray(predictions, dtype=np.uint8).copy()
+        if processed.size == 0:
+            return processed
+
+        if self.config.max_gap_fill > 0:
+            zero_start: int | None = None
+            for index, value in enumerate(processed):
+                if value == 0:
+                    if zero_start is None:
+                        zero_start = index
+                    continue
+                if zero_start is not None:
+                    gap_length = index - zero_start
+                    if zero_start > 0 and gap_length <= self.config.max_gap_fill and processed[zero_start - 1] == 1:
+                        processed[zero_start:index] = 1
+                    zero_start = None
+
+        min_run = max(1, self.config.min_anomaly_run_length)
+        run_start: int | None = None
+        for index, value in enumerate(processed):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is not None:
+                if index - run_start < min_run:
+                    processed[run_start:index] = 0
+                run_start = None
+        if run_start is not None and processed.size - run_start < min_run:
+            processed[run_start:] = 0
+
+        return processed
 
     def _calibrate_thresholds(self, train_df: pd.DataFrame, train_starts: np.ndarray) -> np.ndarray:
         combined, covered = self._aggregate_scores(
@@ -941,6 +990,9 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
+    "tcn_score_smoothing_window": 5,
+    "tcn_min_anomaly_run_length": 5,
+    "tcn_max_gap_fill": 1,
     "tcn_device": "cuda",
     "tcn_dataloader_workers": 8,
     "tcn_preload_dataset": True,
@@ -981,7 +1033,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tol", type=float, default=5.0, help="STD threshold multiplier.")
     parser.add_argument("--half-window", type=int, default=64, help="Half-window size for memory matching.")
     parser.add_argument("--metric", choices=["cosine", "euclidean"], default="cosine")
-    parser.add_argument("--memory-threshold", type=float, default=0.92)
+    parser.add_argument("--memory-threshold", type=float, default=DEFAULT_MEMORY_ARGS["memory_threshold"])
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--results-root", type=Path, default=Path("results/mission1_subset"))
     parser.add_argument("--tcn-preset", choices=["none", *TCN_PRESETS.keys()], default="none")
@@ -1009,6 +1061,21 @@ def parse_args() -> argparse.Namespace:
         "--tcn-calibration-quantile",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_calibration_quantile"],
+    )
+    parser.add_argument(
+        "--tcn-score-smoothing-window",
+        type=int,
+        default=DEFAULT_TCN_ARGS["tcn_score_smoothing_window"],
+    )
+    parser.add_argument(
+        "--tcn-min-anomaly-run-length",
+        type=int,
+        default=DEFAULT_TCN_ARGS["tcn_min_anomaly_run_length"],
+    )
+    parser.add_argument(
+        "--tcn-max-gap-fill",
+        type=int,
+        default=DEFAULT_TCN_ARGS["tcn_max_gap_fill"],
     )
     parser.add_argument("--tcn-device", type=str, default=DEFAULT_TCN_ARGS["tcn_device"])
     parser.add_argument("--tcn-dataloader-workers", type=int, default=DEFAULT_TCN_ARGS["tcn_dataloader_workers"])
@@ -1087,6 +1154,9 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
+        score_smoothing_window=resolved["tcn_score_smoothing_window"],
+        min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
+        max_gap_fill=resolved["tcn_max_gap_fill"],
         device=resolved["tcn_device"],
         dataloader_workers=resolved["tcn_dataloader_workers"],
         mixed_precision=not args.tcn_no_amp,

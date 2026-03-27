@@ -1,81 +1,199 @@
-# Autonomous Anomaly Benchmark
+# autoresearch anomaly benchmark
+
+This repository is designed to support an autonomous experiment loop.
 
 ## Setup
 
-1. Work on a dedicated git branch for this autoresearch run.
-2. Read `README.md`, `prepare.py`, `train.py`, and this file before changing anything.
-3. Verify data exists under `data/ESA-Mission1/` and `data/preprocessed/`.
-4. Use the project virtualenv and invoke Python as `.venv/bin/python`.
-5. Do not modify `prepare.py`. Keep changes focused unless the user explicitly asks for broader work.
+To set up a new autonomous research run, work with the user to:
 
-## In-Scope Files
+1. Agree on a run tag based on today's date, for example `mar26` or `mar26-gpu0`. The branch `autoresearch/<tag>` must not already exist.
+2. Create the branch from the current best base branch:
+   `git checkout -b autoresearch/<tag>`
+3. Read the in-scope files for full context:
+   - `README.md` for repository context and operational notes
+   - `prepare.py` for the fixed harness and evaluation logic
+   - `train.py` for the model, scoring path, and experiment surface
+   - `program.md` for the operating instructions in this file
+4. Verify data exists under `data/ESA-Mission1/` and `data/preprocessed/`. If the subset CSVs are missing, tell the human to run `.venv/bin/python ingest.py`.
+5. Verify the local virtual environment exists and use `.venv/bin/python` for all benchmark commands.
+6. Initialize `results.tsv` in the repository root if it does not exist, with the header:
+   `commit	primary_f05	status	description`
+7. Confirm setup looks good, then begin experimentation.
 
-- `train.py`: primary experiment file. This is the main file to edit.
-- `reading_materials/*.md`: optional literature notes for additional context.
-- `program.md`: human-authored operating instructions for the agent.
+Once setup is confirmed, do not stop for further confirmation. Start the loop.
 
-## Do Not Edit
+## In Scope
 
-- `prepare.py`: fixed harness for data loading, ESA metrics, memory bank logic, and result I/O.
+You may edit:
+
+- `train.py`: this is the primary experiment file and the main place to work
+- `reading_materials/*.md`: optional literature notes when useful
+
+You may read:
+
+- `README.md`
+- `prepare.py`
+- `program.md`
+- `results/mission1_subset/*`
+
+## Out Of Scope
+
+You must not:
+
+- modify `prepare.py`
+- install new packages or add dependencies
+- change the evaluation ground truth in `prepare.py`
+- broaden the project structure unless the human explicitly asks
 
 ## Objective
 
-Maximize the scalar printed at the end of each successful run as `primary_f05=...`.
+The goal is to maximize the scalar printed at the end of a successful run as:
 
-- Primary metric key: `memory.anomaly_only.Anomaly.EW_F_0.50`
-- Direction: `maximize`
-- Meaning: event-wise anomaly F0.5 after memory gating on the anomaly-only labels
+`primary_f05=...`
+
+Ground truth:
+
+- primary metric key: `memory.anomaly_only.Anomaly.EW_F_0.50`
+- direction: `maximize`
+- meaning: anomaly-only event-wise F0.5 after memory gating
+
+Higher is better.
 
 ## Default Experiment Contract
 
-- Use the default benchmark command unless there is a strong reason not to:
-  `.venv/bin/python train.py`
-- The default experiment scope is `--detectors tcn --splits 10_months`.
-- The default TCN training budget is fixed at `900` seconds.
-- Keep the same split, seed, and data layout for fair comparison unless the human changes the contract.
+Each experiment runs with the default command:
+
+`.venv/bin/python train.py`
+
+The default benchmark contract is:
+
+- detector scope: `tcn`
+- split scope: `10_months`
+- TCN wall-clock budget: `900` seconds
+- fixed seeds and comparable data layout unless the human changes the contract
+
+Because the training budget is fixed, you should focus on improving the metric, not on making runs longer.
+
+VRAM is a soft constraint. Some increase is acceptable if it leads to meaningful gains, but avoid gratuitous growth.
+
+Simplicity matters. If two approaches perform similarly, prefer the simpler one. Small improvements that add messy complexity are often not worth keeping.
+
+The first run must always be the baseline with the current code as-is.
 
 ## Output Contract
 
-Successful runs should leave behind:
+Every successful run should produce:
 
 - stdout line `primary_f05=...`
 - stdout line `reading_materials_count=...`
 - stdout line `run_status=success run_summary_json=...`
-- `summary.csv`
-- `reading_materials_snapshot.json`
-- `run_summary.json`
-- append-only `experiment_log.jsonl`
+- `results/mission1_subset/summary.csv`
+- `results/mission1_subset/reading_materials_snapshot.json`
+- `results/mission1_subset/run_summary.json`
+- `results/mission1_subset/experiment_log.jsonl`
 
-Crash runs should still leave:
+After each successful run, also execute:
+
+`.venv/bin/python eval.py --results-root results/mission1_subset`
+
+This should produce:
+
+- stdout line `eval_best_primary=...`
+- stdout line `eval_summary_json=...`
+- stdout line `metrics_long_csv=...`
+- `results/mission1_subset/compact_summary.csv`
+- `results/mission1_subset/compact_summary.json`
+- `results/mission1_subset/leaderboard.csv`
+- `results/mission1_subset/metrics_long.csv`
+- `results/mission1_subset/metrics_long.jsonl`
+- `results/mission1_subset/eval_summary.json`
+
+Crash runs should still produce:
 
 - stdout line `run_status=crash run_summary_json=...`
-- `run_summary.json`
-- append-only `experiment_log.jsonl`
+- `results/mission1_subset/run_summary.json`
+- append-only `results/mission1_subset/experiment_log.jsonl`
 
-## Experiment Loop
+## Logging Results
 
-1. Establish a baseline by running the current `train.py` once before making changes.
-2. Make a focused change in `train.py`.
+Record every experiment in `results.tsv` as tab-separated values. Do not commit this file.
+
+The TSV columns are:
+
+`commit	primary_f05	status	description`
+
+Where:
+
+1. `commit`: short git hash for the experiment commit
+2. `primary_f05`: achieved metric value, or `0.000000` for crashes
+3. `status`: `keep`, `discard`, or `crash`
+4. `description`: short description of the experiment idea
+
+Example:
+
+```text
+commit	primary_f05	status	description
+a1b2c3d	0.165957	keep	fix memory query features
+b2c3d4e	0.150926	discard	raise memory threshold to 0.94
+c3d4e5f	0.000000	crash	break event scoring path
+```
+
+## The Experiment Loop
+
+The experiment runs on a dedicated branch such as `autoresearch/mar26`.
+
+LOOP FOREVER:
+
+1. Look at the git state and identify the current best commit.
+2. Tune `train.py` with one focused experimental idea.
 3. Commit the change.
-4. Run the benchmark with a short description, for example:
-   `.venv/bin/python train.py --experiment-description "increase hidden dim"`
-5. Read `primary_f05` from stdout or `run_summary.json`.
-6. Keep the commit only if the result is better or meaningfully simpler at equal quality.
-7. Discard regressions and move to the next idea.
+4. Run the experiment:
+   `.venv/bin/python train.py --experiment-description "<short description>" > run.log 2>&1`
+5. If the run succeeds, run:
+   `.venv/bin/python eval.py --results-root results/mission1_subset >> run.log 2>&1`
+6. Read the results from `run.log`, `results/mission1_subset/run_summary.json`, and `results/mission1_subset/eval_summary.json`.
+7. Record the result in `results.tsv`.
+8. If `primary_f05` improved, keep the commit and continue from there.
+9. If `primary_f05` is equal or worse, revert to the previous best commit and continue from there.
 
-## Crash Handling
+The idea is simple: if a change works, keep it and advance the branch. If it does not work, discard it and keep searching.
 
-- Treat missing `primary_f05` as a failed run.
-- Read `run_summary.json` first; it should contain the error type and message.
-- If the problem is a simple bug, fix it and rerun once.
-- If the idea is fundamentally bad or unstable, discard it and move on.
+## Timeout Policy
+
+Each experiment should fit comfortably within the 15-minute training budget plus overhead. If a run becomes unexpectedly long or appears hung, kill it and treat it as a failure.
+
+## Crash Policy
+
+If `primary_f05` is missing, treat the run as a crash.
+
+When a run crashes:
+
+1. Read `results/mission1_subset/run_summary.json` first.
+2. If needed, inspect the tail of `run.log`.
+3. If the bug is simple and local, fix it and retry once.
+4. If the idea is fundamentally bad or unstable, log `crash`, revert, and move on.
 
 ## Reading Materials
 
-- Folder: `reading_materials/`
-- Format: one `.md` file per work with YAML front matter and Markdown body
-- At the start of every run, the literature snapshot is embedded into `reading_materials_snapshot.json` and `experiment_log.jsonl`
+The folder `reading_materials/` contains optional literature notes.
 
-## Dependencies
+- Format: one Markdown file per work with YAML front matter and Markdown body
+- At the start of each run, the literature snapshot is written to `reading_materials_snapshot.json`
+- The same snapshot is embedded into `experiment_log.jsonl`
 
-Use the existing environment from `requirements.txt`. The `timeeval` metrics package is vendored locally from `timeeval/`.
+Read these materials when you need better ideas. Do not let reading block the experiment loop.
+
+## Never Stop
+
+Once the loop begins, do not pause to ask the human whether to continue. Do not ask whether this is a good stopping point. Keep iterating until the human explicitly interrupts you.
+
+If you run out of ideas:
+
+- re-read `train.py`
+- re-read recent results
+- inspect failure cases in `metrics_long.csv`
+- revisit thresholding, calibration, event formation, scoring aggregation, query/prototype representation, and memory gating
+- combine near-miss ideas
+- try bolder but still focused changes
+
+The loop is the job.
