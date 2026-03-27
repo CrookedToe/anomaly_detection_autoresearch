@@ -145,13 +145,6 @@ class SelfSupervisedTcnForecaster(nn.Module):
             nn.GELU(),
             nn.Conv1d(config.hidden_dim, config.target_dim, kernel_size=1),
         )
-        self.embedding_head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(config.hidden_dim, config.embedding_dim),
-            nn.GELU(),
-            nn.Linear(config.embedding_dim, config.embedding_dim),
-        )
 
     def encode(self, inputs: torch.Tensor) -> torch.Tensor:
         features = inputs.transpose(1, 2)
@@ -169,7 +162,12 @@ class SelfSupervisedTcnForecaster(nn.Module):
             self.config.target_dim,
         )
         reconstruction = self.reconstruction_head(hidden).transpose(1, 2)
-        embedding = F.normalize(self.embedding_head(hidden), dim=-1)
+        avg_pooled = hidden.mean(dim=2)
+        max_pooled = hidden.amax(dim=2)
+        embedding = 0.5 * (avg_pooled + max_pooled)
+        if embedding.shape[1] != self.config.embedding_dim:
+            embedding = F.adaptive_avg_pool1d(embedding.unsqueeze(1), self.config.embedding_dim).squeeze(1)
+        embedding = F.normalize(embedding, dim=-1)
         return forecast, reconstruction, embedding
 
 
@@ -614,7 +612,6 @@ class TcnAnomalyPipeline:
                         window_values = np.where(np.isnan(window_values), fill_values, window_values)
                     flattened = window_values.reshape(-1, window_values.shape[-1])
                     raw_normalized = ((flattened - self.scaler.raw_mean) / self.scaler.raw_std).reshape(window_values.shape)
-                    diff_features = self._compute_diff_features(raw_normalized)
                     range_dt_seconds = np.float32(self.scaler.nominal_dt_seconds)
                     normalized_dt_value = np.float32((range_dt_seconds - self.scaler.dt_mean) / self.scaler.dt_std)
                     dt_template = np.full(
@@ -623,10 +620,7 @@ class TcnAnomalyPipeline:
                         dtype=np.float32,
                     )
                     gap_template = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
-                    base_features = np.concatenate(
-                        [raw_normalized, diff_features, dt_template, gap_template],
-                        axis=2,
-                    ).astype(np.float32)
+                    base_features = np.concatenate([raw_normalized, dt_template, gap_template], axis=2).astype(np.float32)
                     mask_indicator = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
                 else:
@@ -761,20 +755,11 @@ class TcnAnomalyPipeline:
         assert self.scaler is not None
         raw = frame[self.target_channels].to_numpy(dtype=np.float32)
         raw_normalized = (raw - self.scaler.raw_mean) / self.scaler.raw_std
-        diff_features = self._compute_diff_features(raw_normalized)
         dt_seconds = self._delta_seconds(frame.index)
         dt_normalized = ((dt_seconds - self.scaler.dt_mean) / self.scaler.dt_std).reshape(-1, 1)
         gap_mask = self._gap_mask(frame.index, self.scaler.nominal_dt_seconds).reshape(-1, 1)
-        base_features = np.concatenate([raw_normalized, diff_features, dt_normalized, gap_mask], axis=1).astype(
-            np.float32
-        )
+        base_features = np.concatenate([raw_normalized, dt_normalized, gap_mask], axis=1).astype(np.float32)
         return base_features, raw_normalized.astype(np.float32)
-
-    def _compute_diff_features(self, raw_normalized: np.ndarray) -> np.ndarray:
-        if raw_normalized.size == 0:
-            return np.zeros_like(raw_normalized, dtype=np.float32)
-        diffs = np.diff(raw_normalized, axis=0, prepend=raw_normalized[[0]])
-        return diffs.astype(np.float32, copy=False)
 
     def _gap_mask(self, index: pd.Index, nominal_dt_seconds: float) -> np.ndarray:
         if nominal_dt_seconds <= EPSILON:
