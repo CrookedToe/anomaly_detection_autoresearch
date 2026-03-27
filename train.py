@@ -1167,35 +1167,6 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
-def restore_long_suppressed_runs(
-    baseline_predictions: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    min_run_points: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
-
-    restored = gated_predictions.copy()
-    kept_suppressions: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict("records"):
-        channel = str(row["channel"])
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        run_length = int(baseline_predictions.loc[start_time:end_time, channel].sum())
-        if run_length >= min_run_points:
-            restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
-            continue
-        kept_suppressions.append(row)
-
-    if kept_suppressions:
-        filtered_suppressions = pd.DataFrame(kept_suppressions)
-    else:
-        filtered_suppressions = pd.DataFrame(columns=suppressed_events.columns)
-    return restored, filtered_suppressions
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1225,7 +1196,7 @@ def run_tcn_split(
         labels=train_labels,
         target_channels=args.target_channels,
         half_window=resolved_args["half_window"],
-        vectorizer=pipeline.vectorize_windows,
+        vectorizer=None,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_memory_gating(
@@ -1236,13 +1207,7 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
-        vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_long_suppressed_runs(
-        baseline_predictions=baseline_predictions,
-        gated_predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        min_run_points=20,
+        vectorizer=None,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
