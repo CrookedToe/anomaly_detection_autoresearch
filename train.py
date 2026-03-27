@@ -993,7 +993,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_train_stride": 8,
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
-    "tcn_threshold_std_factor": 3.8,
+    "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
@@ -1399,6 +1399,55 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
+def backfill_supported_run_starts(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    score_ratio: float,
+    max_backfill_points: int,
+    support_window: int,
+) -> pd.DataFrame:
+    backfilled = predictions.copy()
+    prediction_values = backfilled[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+
+            for offset in range(1, max_backfill_points + 1):
+                candidate = run_start - offset
+                if candidate < 0 or series[candidate] == 1:
+                    break
+                if channel_scores[candidate] < (threshold * score_ratio):
+                    break
+
+                support_start = max(0, candidate - support_window)
+                support_stop = min(len(series), candidate + support_window + 1)
+                support = prediction_values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
+                    break
+                series[candidate] = 1
+
+        backfilled[channel] = series
+
+    return backfilled
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1556,6 +1605,15 @@ def run_tcn_split(
         target_channels=args.target_channels,
         pre_points=1,
         post_points=0,
+    )
+    baseline_predictions = backfill_supported_run_starts(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        score_ratio=0.7,
+        max_backfill_points=1,
+        support_window=2,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
