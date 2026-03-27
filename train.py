@@ -487,6 +487,7 @@ class TcnAnomalyPipeline:
         base_features, raw_targets = self._transform_frame(frame)
         n_rows = len(frame)
         target_dim = len(self.target_channels)
+        horizon_weight_values = np.linspace(1.0, 0.5, num=self.config.horizon, dtype=np.float32)
 
         if self.cp is not None:
             xp = self.cp
@@ -494,12 +495,14 @@ class TcnAnomalyPipeline:
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
+            horizon_weights = xp.asarray(horizon_weight_values, dtype=xp.float32)
         else:
             xp = np
             forecast_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             forecast_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_sum = xp.zeros((n_rows, target_dim), dtype=xp.float32)
             recon_count = xp.zeros((n_rows, target_dim), dtype=xp.float32)
+            horizon_weights = horizon_weight_values
 
         batch_size = self.config.batch_size
         with torch.no_grad():
@@ -533,12 +536,14 @@ class TcnAnomalyPipeline:
                         self.cp.add.at(
                             forecast_sum[:, channel_index],
                             future_indices[valid_mask],
-                            forecast_error[:, :, channel_index][valid_mask],
+                            (forecast_error[:, :, channel_index] * horizon_weights[None, :])[valid_mask],
                         )
                         self.cp.add.at(
                             forecast_count[:, channel_index],
                             future_indices[valid_mask],
-                            1.0,
+                            self.cp.broadcast_to(horizon_weights[None, :], forecast_error[:, :, channel_index].shape)[
+                                valid_mask
+                            ],
                         )
                 else:
                     forecast_error = forecast_error_t.cpu().numpy()
@@ -555,8 +560,9 @@ class TcnAnomalyPipeline:
                         for horizon_offset, future_index in enumerate(future_indices):
                             if future_index >= n_rows:
                                 break
-                            forecast_sum[future_index] += forecast_error[row_index, horizon_offset]
-                            forecast_count[future_index] += 1.0
+                            weight = float(horizon_weights[horizon_offset])
+                            forecast_sum[future_index] += forecast_error[row_index, horizon_offset] * weight
+                            forecast_count[future_index] += weight
 
         if self.cp is not None:
             forecast_scores = xp.where(forecast_count > 0, forecast_sum / xp.maximum(forecast_count, 1.0), 0.0)
@@ -593,22 +599,11 @@ class TcnAnomalyPipeline:
     def vectorize_window(self, window: pd.DataFrame) -> np.ndarray:
         return self.vectorize_windows([window])[0]
 
-    def _window_summary_features(self, raw_normalized_windows: np.ndarray) -> np.ndarray:
-        mean_features = raw_normalized_windows.mean(axis=1)
-        std_features = raw_normalized_windows.std(axis=1)
-        quarter = max(1, raw_normalized_windows.shape[1] // 4)
-        leading_mean = raw_normalized_windows[:, :quarter, :].mean(axis=1)
-        trailing_mean = raw_normalized_windows[:, -quarter:, :].mean(axis=1)
-        edge_delta = trailing_mean - leading_mean
-        summary = np.concatenate([mean_features, std_features, edge_delta], axis=1).astype(np.float32)
-        norm = np.linalg.norm(summary, axis=1, keepdims=True)
-        return summary / np.maximum(norm, EPSILON)
-
     def vectorize_windows(self, windows: list[pd.DataFrame] | np.ndarray) -> np.ndarray:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before vectorizing windows.")
         if len(windows) == 0:
-            embedding_dim = self.config.embedding_dim + (3 * len(self.target_channels))
+            embedding_dim = self.config.embedding_dim
             return np.zeros((0, embedding_dim), dtype=np.float32)
 
         self.model.eval()
@@ -638,24 +633,17 @@ class TcnAnomalyPipeline:
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
                 else:
                     model_inputs_list: list[np.ndarray] = []
-                    raw_normalized_list: list[np.ndarray] = []
                     for window in batch_windows:
                         padded = self._pad_or_trim_window(window)
                         base_features, _ = self._transform_frame(padded)
-                        raw_normalized_list.append(base_features[:, : len(self.target_channels)].copy())
                         mask_indicator = np.zeros((len(base_features), 1), dtype=np.float32)
                         model_inputs_list.append(np.concatenate([base_features, mask_indicator], axis=1))
                     model_inputs = np.asarray(model_inputs_list, dtype=np.float32)
-                    raw_normalized = np.asarray(raw_normalized_list, dtype=np.float32)
 
                 tensor = torch.from_numpy(np.asarray(model_inputs, dtype=np.float32)).float().to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     _, _, embedding = self.model(tensor)
-                embedding_values = embedding.cpu().numpy().astype(np.float32)
-                summary_features = self._window_summary_features(raw_normalized)
-                combined_embedding = np.concatenate([embedding_values, summary_features], axis=1).astype(np.float32)
-                combined_norm = np.linalg.norm(combined_embedding, axis=1, keepdims=True)
-                embeddings.append(combined_embedding / np.maximum(combined_norm, EPSILON))
+                embeddings.append(embedding.cpu().numpy().astype(np.float32))
 
         return np.concatenate(embeddings, axis=0)
 
