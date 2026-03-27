@@ -195,7 +195,7 @@ class TcnTrainingConfig:
     kernel_size: int = 3
     dropout: float = 0.05
     batch_size: int = 512
-    learning_rate: float = 1e-3
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-4
     epochs: int = 6
     mask_ratio: float = 0.15
@@ -981,7 +981,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_kernel_size": 3,
     "tcn_dropout": 0.05,
     "tcn_batch_size": 2048,
-    "tcn_learning_rate": 1e-3,
+    "tcn_learning_rate": 5e-4,
     "tcn_weight_decay": 1e-4,
     "tcn_epochs": 4,
     "tcn_mask_ratio": 0.15,
