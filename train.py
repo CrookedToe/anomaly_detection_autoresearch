@@ -1399,6 +1399,44 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
+def bridge_global_event_gaps(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    max_gap_points: int,
+    context_points: int,
+    min_shared_channels: int,
+) -> pd.DataFrame:
+    bridged = predictions.copy()
+    values = bridged[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    global_active = values.any(axis=1).astype(np.uint8)
+    gap_start: int | None = None
+
+    for index, value in enumerate(global_active):
+        if value == 0:
+            if gap_start is None:
+                gap_start = index
+            continue
+        if gap_start is None:
+            continue
+        gap_stop = index
+        gap_length = gap_stop - gap_start
+        if gap_start > 0 and gap_length <= max_gap_points and global_active[gap_start - 1] == 1:
+            left_context = values[max(0, gap_start - context_points) : gap_start]
+            right_context = values[gap_stop : min(len(values), gap_stop + context_points)]
+            if len(left_context) > 0 and len(right_context) > 0:
+                left_channels = left_context.any(axis=0)
+                right_channels = right_context.any(axis=0)
+                shared_channels = left_channels & right_channels
+                if int(shared_channels.sum()) >= min_shared_channels:
+                    values[gap_start:gap_stop, shared_channels] = 1
+                    global_active[gap_start:gap_stop] = 1
+        gap_start = None
+
+    for channel_index, channel in enumerate(target_channels):
+        bridged[channel] = values[:, channel_index]
+    return bridged
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1594,11 +1632,12 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
-    gated_predictions = prune_short_isolated_runs(
+    gated_predictions = bridge_global_event_gaps(
         predictions=gated_predictions,
         target_channels=args.target_channels,
-        min_run_points=12,
-        support_padding=8,
+        max_gap_points=40,
+        context_points=20,
+        min_shared_channels=1,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
