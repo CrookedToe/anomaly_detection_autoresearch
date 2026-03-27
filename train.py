@@ -1298,9 +1298,6 @@ def prune_weak_isolated_runs(
                 continue
             if peak_score > peak_cutoff or mean_score > density_cutoff:
                 continue
-            support_overlap = prediction_values[run_start:run_stop].sum(axis=1) - series[run_start:run_stop]
-            if support_overlap.max(initial=0) >= 3:
-                continue
             support_start = max(0, run_start - support_padding)
             support_stop = min(len(series), run_stop + support_padding)
             support = prediction_values[support_start:support_stop].copy()
@@ -1402,6 +1399,49 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
+def restore_synchronous_delta_spikes(
+    predictions: pd.DataFrame,
+    frame: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_support_channels: int,
+    delta_z_threshold: float,
+    min_score_ratio: float,
+    padding_points: int,
+) -> pd.DataFrame:
+    restored = predictions.copy()
+    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    raw_values = frame[target_channels].to_numpy(dtype=np.float32, copy=False)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    if len(raw_values) == 0:
+        return restored
+
+    delta = np.abs(np.diff(raw_values, axis=0, prepend=raw_values[:1]))
+    channel_medians = np.median(delta, axis=0)
+    channel_mads = np.median(np.abs(delta - channel_medians), axis=0)
+    robust_scale = np.maximum(channel_mads * 1.4826, EPSILON)
+    delta_z = (delta - channel_medians) / robust_scale
+    support = (delta_z >= delta_z_threshold).sum(axis=1)
+
+    for index in np.flatnonzero(support >= min_support_channels):
+        start = max(0, index - max(0, padding_points))
+        stop = min(len(prediction_values), index + max(0, padding_points) + 1)
+        for channel_index in range(len(target_channels)):
+            if delta_z[index, channel_index] < delta_z_threshold:
+                continue
+            threshold = max(float(thresholds[channel_index]), EPSILON)
+            local_peak = float(np.max(score_values[start:stop, channel_index])) if stop > start else 0.0
+            if local_peak < (threshold * min_score_ratio):
+                continue
+            prediction_values[start:stop, channel_index] = 1
+
+    restored[target_channels] = prediction_values
+    return restored
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1452,9 +1492,6 @@ def prune_noisy_channel_short_runs(
 
         for run_start, run_stop, run_length, peak_ratio in runs:
             if run_length >= min_run_points or peak_ratio > max_short_run_peak_ratio:
-                continue
-            support_overlap = prediction_values[run_start:run_stop].sum(axis=1) - series[run_start:run_stop]
-            if support_overlap.max(initial=0) >= 3:
                 continue
             support_start = max(0, run_start - support_padding)
             support_stop = min(len(series), run_stop + support_padding)
@@ -1573,6 +1610,17 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
+    )
+    baseline_predictions = restore_synchronous_delta_spikes(
+        predictions=baseline_predictions,
+        frame=test_df,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_support_channels=5,
+        delta_z_threshold=6.0,
+        min_score_ratio=0.8,
+        padding_points=1,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
