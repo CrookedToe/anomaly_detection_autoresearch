@@ -1463,44 +1463,47 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def restore_high_margin_suppressions(
+def extend_very_high_confidence_run_starts(
     predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
+    min_run_points: int,
     min_peak_ratio: float,
-    max_memory_score: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return predictions, suppressed_events
-
-    restored = predictions.copy()
+    extra_pre_points: int,
+) -> pd.DataFrame:
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
     thresholds = np.asarray(global_thresholds, dtype=np.float32)
-    threshold_by_channel = {
-        channel: max(float(thresholds[channel_index]), EPSILON)
-        for channel_index, channel in enumerate(target_channels)
-    }
-    keep_rows: list[bool] = []
 
-    for row in suppressed_events.itertuples(index=False):
-        start_time = pd.Timestamp(row.start_time)
-        end_time = pd.Timestamp(row.end_time)
-        channel = str(row.channel)
-        threshold = threshold_by_channel.get(channel)
-        if threshold is None:
-            keep_rows.append(True)
-            continue
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
 
-        peak_score = float(scores.loc[start_time:end_time, channel].max())
-        peak_ratio = peak_score / threshold
-        restore_run = peak_ratio >= min_peak_ratio and float(row.score) <= max_memory_score
-        keep_rows.append(not restore_run)
-        if restore_run:
-            restored.loc[start_time:end_time, channel] = 1
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
 
-    remaining_suppressed = suppressed_events.loc[keep_rows].reset_index(drop=True)
-    return restored, remaining_suppressed
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            run_length = run_stop - run_start
+            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+            if run_length < min_run_points or run_peak_ratio < min_peak_ratio:
+                continue
+
+            extend_start = max(0, run_start - max(0, extra_pre_points))
+            series[extend_start:run_start] = 1
+
+        extended[channel] = series
+
+    return extended
 
 
 def apply_same_channel_memory_gating(
@@ -1597,6 +1600,15 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
+    baseline_predictions = extend_very_high_confidence_run_starts(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_run_points=60,
+        min_peak_ratio=30.0,
+        extra_pre_points=1,
+    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1633,15 +1645,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_high_margin_suppressions(
-        predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_peak_ratio=10.0,
-        max_memory_score=0.95,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
