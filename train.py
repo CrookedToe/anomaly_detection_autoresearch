@@ -208,6 +208,7 @@ class TcnTrainingConfig:
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
+    strong_alert_score_scale: float = 1.5
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
     max_gap_fill: int = 2
@@ -990,6 +991,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
+    "tcn_strong_alert_score_scale": 1.5,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
     "tcn_max_gap_fill": 2,
@@ -1061,6 +1063,11 @@ def parse_args() -> argparse.Namespace:
         "--tcn-calibration-quantile",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_calibration_quantile"],
+    )
+    parser.add_argument(
+        "--tcn-strong-alert-score-scale",
+        type=float,
+        default=DEFAULT_TCN_ARGS["tcn_strong_alert_score_scale"],
     )
     parser.add_argument(
         "--tcn-score-smoothing-window",
@@ -1154,6 +1161,7 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
+        strong_alert_score_scale=resolved["tcn_strong_alert_score_scale"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
         max_gap_fill=resolved["tcn_max_gap_fill"],
@@ -1198,6 +1206,13 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
+    strong_alerts = baseline_predictions.copy()
+    strong_alerts.loc[:, :] = 0
+    if pipeline.global_thresholds is not None:
+        for channel_index, channel in enumerate(args.target_channels):
+            strong_threshold = pipeline.global_thresholds[channel_index] * tcn_config.strong_alert_score_scale
+            strong_alerts[channel] = (baseline_scores[channel].to_numpy() >= strong_threshold).astype(np.uint8)
+
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_memory_gating(
         frame=test_df,
@@ -1209,6 +1224,7 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
+    gated_predictions = ((gated_predictions > 0) | (strong_alerts > 0)).astype(np.uint8)
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
