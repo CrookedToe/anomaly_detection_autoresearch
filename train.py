@@ -1410,6 +1410,58 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def repair_gated_run_fragmentation(
+    gated_predictions: pd.DataFrame,
+    baseline_predictions: pd.DataFrame,
+    target_channels: list[str],
+    max_gap_points: int,
+    min_neighbor_run_points: int,
+) -> pd.DataFrame:
+    repaired = gated_predictions.copy()
+    gated_values = repaired[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = gated_values[:, channel_index].copy()
+        baseline_series = baseline_values[:, channel_index]
+        zero_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 0:
+                if zero_start is None:
+                    zero_start = index
+                continue
+
+            if zero_start is None:
+                continue
+
+            gap_start = zero_start
+            gap_stop = index
+            gap_length = gap_stop - gap_start
+            zero_start = None
+            if gap_start == 0 or gap_length > max_gap_points or series[gap_start - 1] != 1:
+                continue
+
+            left_start = gap_start - 1
+            while left_start > 0 and series[left_start - 1] == 1:
+                left_start -= 1
+            right_stop = gap_stop
+            while right_stop < len(series) and series[right_stop] == 1:
+                right_stop += 1
+
+            left_length = gap_start - left_start
+            right_length = right_stop - gap_stop
+            if left_length < min_neighbor_run_points or right_length < min_neighbor_run_points:
+                continue
+
+            if baseline_series[gap_start:gap_stop].any():
+                series[gap_start:gap_stop] = 1
+
+        repaired[channel] = series
+
+    return repaired
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1480,6 +1532,13 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = repair_gated_run_fragmentation(
+        gated_predictions=gated_predictions,
+        baseline_predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        max_gap_points=4,
+        min_neighbor_run_points=3,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
