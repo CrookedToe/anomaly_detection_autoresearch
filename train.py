@@ -1399,6 +1399,43 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
+def expand_supported_run_boundaries(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    min_support_channels: int,
+    pre_points: int,
+    post_points: int,
+) -> pd.DataFrame:
+    expanded = predictions.copy()
+    prediction_values = expanded[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            support = prediction_values[run_start:run_stop].sum(axis=1) - 1
+            if support.size == 0 or int(support.max()) < min_support_channels:
+                continue
+
+            expand_start = max(0, run_start - max(0, pre_points))
+            expand_stop = min(len(series), run_stop + max(0, post_points))
+            series[expand_start:expand_stop] = 1
+
+        expanded[channel] = series
+
+    return expanded
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1506,46 +1543,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_duration_mismatched_suppressions(
-    predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    memory_bank: RareNominalMemoryBank,
-    min_duration_ratio: float,
-    max_match_score: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return predictions, suppressed_events
-
-    prototype_duration_seconds: dict[str, float] = {}
-    for prototype in memory_bank.prototypes:
-        start_time = pd.Timestamp(prototype.start_time)
-        end_time = pd.Timestamp(prototype.end_time)
-        prototype_duration_seconds[prototype.prototype_id] = max((end_time - start_time).total_seconds(), 30.0)
-
-    restored = predictions.copy()
-    kept_rows: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict("records"):
-        prototype_duration = prototype_duration_seconds.get(str(row["prototype_id"]))
-        if prototype_duration is None:
-            kept_rows.append(row)
-            continue
-
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        run_duration = max((end_time - start_time).total_seconds(), 30.0)
-        duration_ratio = run_duration / prototype_duration
-        match_score = float(row["score"])
-
-        if duration_ratio >= min_duration_ratio and match_score <= max_match_score:
-            restored.loc[start_time:end_time, str(row["channel"])] = 1
-            continue
-
-        kept_rows.append(row)
-
-    return restored, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1608,6 +1605,13 @@ def run_tcn_split(
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
     )
+    baseline_predictions = expand_supported_run_boundaries(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        min_support_channels=3,
+        pre_points=1,
+        post_points=1,
+    )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1633,13 +1637,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_duration_mismatched_suppressions(
-        predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        memory_bank=memory_bank,
-        min_duration_ratio=4.0,
-        max_match_score=0.94,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
