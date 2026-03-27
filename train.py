@@ -1463,50 +1463,6 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def pad_extreme_short_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    max_run_points: int,
-    min_peak_ratio: float,
-    pad_points: int,
-) -> pd.DataFrame:
-    extended = predictions.copy()
-    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
-
-            run_length = run_stop - run_start
-            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if run_length > max_run_points or run_peak_ratio < min_peak_ratio:
-                continue
-
-            extend_start = max(0, run_start - max(0, pad_points))
-            extend_stop = min(len(series), run_stop + max(0, pad_points))
-            series[extend_start:extend_stop] = 1
-
-        extended[channel] = series
-
-    return extended
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1600,15 +1556,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         pre_points=1,
         post_points=0,
-    )
-    baseline_predictions = pad_extreme_short_runs(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_run_points=2,
-        min_peak_ratio=12.0,
-        pad_points=1,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
