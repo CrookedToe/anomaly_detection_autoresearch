@@ -816,6 +816,7 @@ class TcnAnomalyPipeline:
     def _dynamic_threshold(self, scores: pd.DataFrame) -> pd.DataFrame:
         thresholded = pd.DataFrame(index=scores.index)
         global_thresholds = self.global_thresholds if self.global_thresholds is not None else np.zeros(len(self.target_channels))
+        threshold_history_cap_ratio = 1.75
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
@@ -828,7 +829,8 @@ class TcnAnomalyPipeline:
                 min_periods=1,
             ).max()
             smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
-            threshold_source = smoothed_series.shift(1)
+            capped_threshold_source = smoothed_series.clip(upper=global_thresholds[channel_index] * threshold_history_cap_ratio)
+            threshold_source = capped_threshold_source.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
@@ -1506,56 +1508,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_extreme_consensus_spikes(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_consensus_channels: int,
-    min_channel_ratio: float,
-    max_segment_points: int,
-    backfill_points: int,
-    isolation_padding: int,
-) -> pd.DataFrame:
-    restored = predictions.copy()
-    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-    score_ratios = score_values / thresholds[None, :]
-    active_any = prediction_values.any(axis=1)
-    consensus_mask = (score_ratios >= min_channel_ratio).sum(axis=1) >= min_consensus_channels
-    consensus_mask &= ~active_any
-
-    index = 0
-    while index < len(consensus_mask):
-        if not consensus_mask[index]:
-            index += 1
-            continue
-
-        segment_start = index
-        while index < len(consensus_mask) and consensus_mask[index]:
-            index += 1
-        segment_stop = index
-
-        if (segment_stop - segment_start) > max_segment_points:
-            continue
-
-        support_start = max(0, segment_start - isolation_padding)
-        support_stop = min(len(active_any), segment_stop + isolation_padding)
-        if active_any[support_start:support_stop].any():
-            continue
-
-        restore_start = max(0, segment_start - backfill_points)
-        restore_stop = segment_stop
-        segment_ratios = score_ratios[segment_start:segment_stop]
-        for channel_index, channel in enumerate(target_channels):
-            if float(segment_ratios[:, channel_index].max()) < min_channel_ratio:
-                continue
-            restored.iloc[restore_start:restore_stop, restored.columns.get_loc(channel)] = 1
-
-    return restored
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1643,17 +1595,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions = restore_extreme_consensus_spikes(
-        predictions=gated_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_consensus_channels=6,
-        min_channel_ratio=8.0,
-        max_segment_points=12,
-        backfill_points=6,
-        isolation_padding=24,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
