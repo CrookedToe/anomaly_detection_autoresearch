@@ -1167,6 +1167,50 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
+def prune_short_isolated_runs(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    min_run_points: int,
+    support_padding: int,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = values[:, channel_index].copy()
+        run_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 1 and run_start is None:
+                run_start = index
+                continue
+            if value == 1:
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            run_length = run_stop - run_start
+            if run_length < min_run_points:
+                support_start = max(0, run_start - support_padding)
+                support_stop = min(len(series), run_stop + support_padding)
+                support = values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
+                    series[run_start:run_stop] = 0
+            run_start = None
+        if run_start is not None:
+            run_stop = len(series)
+            run_length = run_stop - run_start
+            if run_length < min_run_points:
+                support_start = max(0, run_start - support_padding)
+                support = values[support_start:run_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
+                    series[run_start:run_stop] = 0
+        pruned[channel] = series
+
+    return pruned
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1182,6 +1226,12 @@ def run_tcn_split(
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
+    baseline_predictions = prune_short_isolated_runs(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        min_run_points=20,
+        support_padding=8,
+    )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
@@ -1196,7 +1246,7 @@ def run_tcn_split(
         labels=train_labels,
         target_channels=args.target_channels,
         half_window=resolved_args["half_window"],
-        vectorizer=None,
+        vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_memory_gating(
@@ -1207,7 +1257,7 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
-        vectorizer=None,
+        vectorizer=pipeline.vectorize_windows,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
