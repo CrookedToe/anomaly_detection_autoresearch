@@ -145,6 +145,13 @@ class SelfSupervisedTcnForecaster(nn.Module):
             nn.GELU(),
             nn.Conv1d(config.hidden_dim, config.target_dim, kernel_size=1),
         )
+        self.embedding_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(config.hidden_dim, config.embedding_dim),
+            nn.GELU(),
+            nn.Linear(config.embedding_dim, config.embedding_dim),
+        )
 
     def encode(self, inputs: torch.Tensor) -> torch.Tensor:
         features = inputs.transpose(1, 2)
@@ -162,12 +169,7 @@ class SelfSupervisedTcnForecaster(nn.Module):
             self.config.target_dim,
         )
         reconstruction = self.reconstruction_head(hidden).transpose(1, 2)
-        avg_pooled = hidden.mean(dim=2)
-        max_pooled = hidden.amax(dim=2)
-        embedding = 0.5 * (avg_pooled + max_pooled)
-        if embedding.shape[1] != self.config.embedding_dim:
-            embedding = F.adaptive_avg_pool1d(embedding.unsqueeze(1), self.config.embedding_dim).squeeze(1)
-        embedding = F.normalize(embedding, dim=-1)
+        embedding = F.normalize(self.embedding_head(hidden), dim=-1)
         return forecast, reconstruction, embedding
 
 
@@ -837,7 +839,21 @@ class TcnAnomalyPipeline:
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
+            continue_threshold = np.maximum(threshold * 0.9, global_thresholds[channel_index])
+            raw_prediction = np.zeros(len(smoothed_series), dtype=np.uint8)
+            active = False
+            for index, score in enumerate(smoothed_series.to_numpy(dtype=np.float32, copy=False)):
+                start_threshold = float(threshold.iloc[index])
+                if not active:
+                    if score > start_threshold:
+                        raw_prediction[index] = 1
+                        active = True
+                    continue
+                sustain_threshold = float(continue_threshold.iloc[index])
+                if score > sustain_threshold:
+                    raw_prediction[index] = 1
+                    continue
+                active = False
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
         return thresholded
