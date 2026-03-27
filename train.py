@@ -210,7 +210,7 @@ class TcnTrainingConfig:
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
-    max_gap_fill: int = 1
+    max_gap_fill: int = 2
     validation_fraction: float = 0.1
     random_seed: int = 42
     device: str = "cuda"
@@ -992,7 +992,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
-    "tcn_max_gap_fill": 1,
+    "tcn_max_gap_fill": 2,
     "tcn_device": "cuda",
     "tcn_dataloader_workers": 8,
     "tcn_preload_dataset": True,
