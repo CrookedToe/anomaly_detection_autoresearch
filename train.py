@@ -1463,60 +1463,80 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def restore_strong_removed_runs(
-    raw_predictions: pd.DataFrame,
-    cleaned_predictions: pd.DataFrame,
+def split_weak_isolated_runs(
+    predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
+    support_padding: int,
     max_run_points: int,
-    min_peak_ratio: float,
-    min_mean_ratio: float,
-) -> pd.DataFrame:
-    restored = cleaned_predictions.copy()
-    raw_values = raw_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
-    cleaned_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    max_peak_ratio: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    strict_subset = predictions.copy()
+    strict_subset[target_channels] = 0
+    remainder = predictions.copy()
+    prediction_values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
     score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    strict_values = strict_subset[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    remainder_values = remainder[target_channels].to_numpy(dtype=np.uint8, copy=True)
     thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
-        raw_series = raw_values[:, channel_index]
-        cleaned_series = cleaned_values[:, channel_index].copy()
+        series = prediction_values[:, channel_index]
         channel_scores = score_values[:, channel_index]
         threshold = max(float(thresholds[channel_index]), EPSILON)
         index = 0
 
-        while index < len(raw_series):
-            if raw_series[index] != 1:
+        while index < len(series):
+            if series[index] != 1:
                 index += 1
                 continue
 
             run_start = index
-            while index < len(raw_series) and raw_series[index] == 1:
+            while index < len(series) and series[index] == 1:
                 index += 1
             run_stop = index
-
-            if cleaned_series[run_start:run_stop].any():
-                continue
 
             run_length = run_stop - run_start
             if run_length > max_run_points:
                 continue
 
             segment = channel_scores[run_start:run_stop]
-            if len(segment) == 0:
+            if len(segment) == 0 or (float(segment.max()) / threshold) > max_peak_ratio:
                 continue
 
-            peak_ratio = float(segment.max()) / threshold
-            mean_ratio = float(segment.mean()) / threshold
-            if peak_ratio < min_peak_ratio or mean_ratio < min_mean_ratio:
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = prediction_values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            if support.any():
                 continue
 
-            cleaned_series[run_start:run_stop] = 1
+            strict_values[run_start:run_stop, channel_index] = 1
+            remainder_values[run_start:run_stop, channel_index] = 0
 
-        restored[channel] = cleaned_series
+    strict_subset[target_channels] = strict_values
+    remainder[target_channels] = remainder_values
+    return strict_subset, remainder
 
-    return restored
+
+def combine_prediction_frames(predictions: list[pd.DataFrame], target_channels: list[str]) -> pd.DataFrame:
+    combined = predictions[0].copy()
+    combined[target_channels] = 0
+    combined_values = combined[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for frame in predictions:
+        combined_values = np.maximum(combined_values, frame[target_channels].to_numpy(dtype=np.uint8, copy=False))
+
+    combined[target_channels] = combined_values
+    return combined
+
+
+def concat_suppressed_events(*frames: pd.DataFrame) -> pd.DataFrame:
+    usable = [frame for frame in frames if not frame.empty]
+    if not usable:
+        return pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
+    return pd.concat(usable, ignore_index=True)
 
 
 def apply_same_channel_memory_gating(
@@ -1562,6 +1582,54 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def apply_selective_same_channel_memory_gating(
+    frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    memory_bank: RareNominalMemoryBank,
+    half_window: int,
+    metric: str,
+    default_threshold: float,
+    strict_short_threshold: float,
+    global_thresholds: np.ndarray,
+    vectorizer: Any | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    strict_predictions, default_predictions = split_weak_isolated_runs(
+        predictions=predictions,
+        scores=scores,
+        target_channels=target_channels,
+        global_thresholds=global_thresholds,
+        support_padding=8,
+        max_run_points=12,
+        max_peak_ratio=1.35,
+    )
+    default_gated, default_suppressed = apply_same_channel_memory_gating(
+        frame=frame,
+        predictions=default_predictions,
+        target_channels=target_channels,
+        memory_bank=memory_bank,
+        half_window=half_window,
+        metric=metric,
+        threshold=default_threshold,
+        vectorizer=vectorizer,
+    )
+    strict_gated, strict_suppressed = apply_same_channel_memory_gating(
+        frame=frame,
+        predictions=strict_predictions,
+        target_channels=target_channels,
+        memory_bank=memory_bank,
+        half_window=half_window,
+        metric=metric,
+        threshold=strict_short_threshold,
+        vectorizer=vectorizer,
+    )
+    return combine_prediction_frames([default_gated, strict_gated], target_channels), concat_suppressed_events(
+        default_suppressed,
+        strict_suppressed,
+    )
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1577,7 +1645,6 @@ def run_tcn_split(
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
-    raw_baseline_predictions = baseline_predictions.copy()
     baseline_predictions = prune_short_isolated_runs(
         predictions=baseline_predictions,
         target_channels=args.target_channels,
@@ -1625,16 +1692,6 @@ def run_tcn_split(
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
     )
-    baseline_predictions = restore_strong_removed_runs(
-        raw_predictions=raw_baseline_predictions,
-        cleaned_predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_run_points=8,
-        min_peak_ratio=1.6,
-        min_mean_ratio=1.05,
-    )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1651,14 +1708,17 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
+    gated_predictions, suppressed_events = apply_selective_same_channel_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
+        scores=baseline_scores,
         target_channels=args.target_channels,
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
         metric=args.metric,
-        threshold=resolved_args["memory_threshold"],
+        default_threshold=resolved_args["memory_threshold"],
+        strict_short_threshold=max(0.88, resolved_args["memory_threshold"] - 0.02),
+        global_thresholds=pipeline.global_thresholds,
         vectorizer=pipeline.vectorize_windows,
     )
 
