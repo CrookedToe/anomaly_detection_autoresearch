@@ -614,6 +614,7 @@ class TcnAnomalyPipeline:
                         window_values = np.where(np.isnan(window_values), fill_values, window_values)
                     flattened = window_values.reshape(-1, window_values.shape[-1])
                     raw_normalized = ((flattened - self.scaler.raw_mean) / self.scaler.raw_std).reshape(window_values.shape)
+                    diff_features = self._compute_diff_features(raw_normalized)
                     range_dt_seconds = np.float32(self.scaler.nominal_dt_seconds)
                     normalized_dt_value = np.float32((range_dt_seconds - self.scaler.dt_mean) / self.scaler.dt_std)
                     dt_template = np.full(
@@ -622,7 +623,10 @@ class TcnAnomalyPipeline:
                         dtype=np.float32,
                     )
                     gap_template = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
-                    base_features = np.concatenate([raw_normalized, dt_template, gap_template], axis=2).astype(np.float32)
+                    base_features = np.concatenate(
+                        [raw_normalized, diff_features, dt_template, gap_template],
+                        axis=2,
+                    ).astype(np.float32)
                     mask_indicator = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
                 else:
@@ -757,11 +761,20 @@ class TcnAnomalyPipeline:
         assert self.scaler is not None
         raw = frame[self.target_channels].to_numpy(dtype=np.float32)
         raw_normalized = (raw - self.scaler.raw_mean) / self.scaler.raw_std
+        diff_features = self._compute_diff_features(raw_normalized)
         dt_seconds = self._delta_seconds(frame.index)
         dt_normalized = ((dt_seconds - self.scaler.dt_mean) / self.scaler.dt_std).reshape(-1, 1)
         gap_mask = self._gap_mask(frame.index, self.scaler.nominal_dt_seconds).reshape(-1, 1)
-        base_features = np.concatenate([raw_normalized, dt_normalized, gap_mask], axis=1).astype(np.float32)
+        base_features = np.concatenate([raw_normalized, diff_features, dt_normalized, gap_mask], axis=1).astype(
+            np.float32
+        )
         return base_features, raw_normalized.astype(np.float32)
+
+    def _compute_diff_features(self, raw_normalized: np.ndarray) -> np.ndarray:
+        if raw_normalized.size == 0:
+            return np.zeros_like(raw_normalized, dtype=np.float32)
+        diffs = np.diff(raw_normalized, axis=0, prepend=raw_normalized[[0]])
+        return diffs.astype(np.float32, copy=False)
 
     def _gap_mask(self, index: pd.Index, nominal_dt_seconds: float) -> np.ndarray:
         if nominal_dt_seconds <= EPSILON:
@@ -1249,112 +1262,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def extend_supported_run_edges(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray | None,
-    support_padding: int,
-    max_extension_points: int,
-    min_score_ratio: float,
-) -> pd.DataFrame:
-    if global_thresholds is None:
-        return predictions
-
-    extended = predictions.copy()
-    values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        base_threshold = float(global_thresholds[channel_index])
-        if base_threshold <= 0.0:
-            continue
-
-        series = values[:, channel_index].copy()
-        channel_scores = scores[channel].to_numpy(dtype=np.float32, copy=False)
-        run_start: int | None = None
-        for index, value in enumerate(series):
-            if value == 1 and run_start is None:
-                run_start = index
-                continue
-            if value == 1:
-                continue
-            if run_start is None:
-                continue
-            series = _extend_run_edges_with_support(
-                series=series,
-                values=values,
-                channel_index=channel_index,
-                channel_scores=channel_scores,
-                run_start=run_start,
-                run_stop=index,
-                base_threshold=base_threshold,
-                support_padding=support_padding,
-                max_extension_points=max_extension_points,
-                min_score_ratio=min_score_ratio,
-            )
-            run_start = None
-
-        if run_start is not None:
-            series = _extend_run_edges_with_support(
-                series=series,
-                values=values,
-                channel_index=channel_index,
-                channel_scores=channel_scores,
-                run_start=run_start,
-                run_stop=len(series),
-                base_threshold=base_threshold,
-                support_padding=support_padding,
-                max_extension_points=max_extension_points,
-                min_score_ratio=min_score_ratio,
-            )
-        extended[channel] = series
-
-    return extended
-
-
-def _extend_run_edges_with_support(
-    series: np.ndarray,
-    values: np.ndarray,
-    channel_index: int,
-    channel_scores: np.ndarray,
-    run_start: int,
-    run_stop: int,
-    base_threshold: float,
-    support_padding: int,
-    max_extension_points: int,
-    min_score_ratio: float,
-) -> np.ndarray:
-    min_score = base_threshold * min_score_ratio
-
-    steps = 0
-    position = run_start - 1
-    while position >= 0 and steps < max_extension_points and series[position] == 0:
-        support_start = max(0, position - support_padding)
-        support_stop = min(len(series), position + support_padding + 1)
-        support = values[support_start:support_stop].copy()
-        support[:, channel_index] = 0
-        if not support.any() or float(channel_scores[position]) < min_score:
-            break
-        series[position] = 1
-        position -= 1
-        steps += 1
-
-    steps = 0
-    position = run_stop
-    while position < len(series) and steps < max_extension_points and series[position] == 0:
-        support_start = max(0, position - support_padding)
-        support_stop = min(len(series), position + support_padding + 1)
-        support = values[support_start:support_stop].copy()
-        support[:, channel_index] = 0
-        if not support.any() or float(channel_scores[position]) < min_score:
-            break
-        series[position] = 1
-        position += 1
-        steps += 1
-
-    return series
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1424,15 +1331,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         max_gap_points=8,
         support_padding=8,
-    )
-    baseline_predictions = extend_supported_run_edges(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        max_extension_points=3,
-        min_score_ratio=0.85,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
