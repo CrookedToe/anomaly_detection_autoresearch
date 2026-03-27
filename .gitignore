@@ -234,3 +234,4 @@ dask-worker-space
 *.stds
 *.h5
 *.pkl
+*:Zone.Identifier
