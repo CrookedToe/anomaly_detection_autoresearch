@@ -1244,18 +1244,18 @@ def merge_supported_close_runs(
     return merged
 
 
-def trim_unsupported_run_edges(
+def split_long_runs_from_memory_gating(
     predictions: pd.DataFrame,
     target_channels: list[str],
-    edge_points: int,
-    support_padding: int,
-    min_core_points: int,
-) -> pd.DataFrame:
-    trimmed = predictions.copy()
-    values = trimmed[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    max_run_points: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    gating_input = predictions.copy()
+    preserved = predictions.copy()
+    preserved.loc[:, :] = 0
+    values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
 
     for channel_index, channel in enumerate(target_channels):
-        series = values[:, channel_index].copy()
+        series = values[:, channel_index]
         run_start: int | None = None
         for index, value in enumerate(series):
             if value == 1 and run_start is None:
@@ -1266,38 +1266,17 @@ def trim_unsupported_run_edges(
             if run_start is None:
                 continue
             run_stop = index
-            run_length = run_stop - run_start
-            if run_length - edge_points >= min_core_points:
-                head_stop = min(run_start + edge_points, run_stop)
-                support = values[max(0, run_start - support_padding) : min(len(series), head_stop + support_padding)].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    series[run_start:head_stop] = 0
-            if run_length - edge_points >= min_core_points:
-                tail_start = max(run_start, run_stop - edge_points)
-                support = values[max(0, tail_start - support_padding) : min(len(series), run_stop + support_padding)].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    series[tail_start:run_stop] = 0
+            if run_stop - run_start > max_run_points:
+                gating_input.loc[predictions.index[run_start:run_stop], channel] = 0
+                preserved.loc[predictions.index[run_start:run_stop], channel] = 1
             run_start = None
         if run_start is not None:
             run_stop = len(series)
-            run_length = run_stop - run_start
-            if run_length - edge_points >= min_core_points:
-                head_stop = min(run_start + edge_points, run_stop)
-                support = values[max(0, run_start - support_padding) : min(len(series), head_stop + support_padding)].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    series[run_start:head_stop] = 0
-            if run_length - edge_points >= min_core_points:
-                tail_start = max(run_start, run_stop - edge_points)
-                support = values[max(0, tail_start - support_padding) : run_stop].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    series[tail_start:run_stop] = 0
-        trimmed[channel] = series
+            if run_stop - run_start > max_run_points:
+                gating_input.loc[predictions.index[run_start:run_stop], channel] = 0
+                preserved.loc[predictions.index[run_start:run_stop], channel] = 1
 
-    return trimmed
+    return gating_input, preserved
 
 
 def apply_same_channel_memory_gating(
@@ -1370,12 +1349,10 @@ def run_tcn_split(
         max_gap_points=8,
         support_padding=8,
     )
-    baseline_predictions = trim_unsupported_run_edges(
+    memory_gating_input, preserved_predictions = split_long_runs_from_memory_gating(
         predictions=baseline_predictions,
         target_channels=args.target_channels,
-        edge_points=8,
-        support_padding=8,
-        min_core_points=12,
+        max_run_points=40,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
@@ -1396,13 +1373,16 @@ def run_tcn_split(
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
-        predictions=baseline_predictions,
+        predictions=memory_gating_input,
         target_channels=args.target_channels,
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = ((gated_predictions[args.target_channels] | preserved_predictions[args.target_channels]).astype(np.uint8)).reindex(
+        columns=args.target_channels
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
