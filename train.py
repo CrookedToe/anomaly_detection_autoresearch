@@ -819,10 +819,15 @@ class TcnAnomalyPipeline:
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
-            smoothed_series = series.rolling(
+            rolling_mean = series.rolling(
                 self.config.score_smoothing_window,
                 min_periods=1,
             ).mean()
+            rolling_max = series.rolling(
+                self.config.score_smoothing_window,
+                min_periods=1,
+            ).max()
+            smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
             threshold_source = smoothed_series.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
@@ -1244,41 +1249,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def split_long_runs_from_memory_gating(
-    predictions: pd.DataFrame,
-    target_channels: list[str],
-    max_run_points: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    gating_input = predictions.copy()
-    preserved = predictions.copy()
-    preserved.loc[:, :] = 0
-    values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = values[:, channel_index]
-        run_start: int | None = None
-        for index, value in enumerate(series):
-            if value == 1 and run_start is None:
-                run_start = index
-                continue
-            if value == 1:
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            if run_stop - run_start > max_run_points:
-                gating_input.loc[predictions.index[run_start:run_stop], channel] = 0
-                preserved.loc[predictions.index[run_start:run_stop], channel] = 1
-            run_start = None
-        if run_start is not None:
-            run_stop = len(series)
-            if run_stop - run_start > max_run_points:
-                gating_input.loc[predictions.index[run_start:run_stop], channel] = 0
-                preserved.loc[predictions.index[run_start:run_stop], channel] = 1
-
-    return gating_input, preserved
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1349,11 +1319,6 @@ def run_tcn_split(
         max_gap_points=8,
         support_padding=8,
     )
-    memory_gating_input, preserved_predictions = split_long_runs_from_memory_gating(
-        predictions=baseline_predictions,
-        target_channels=args.target_channels,
-        max_run_points=40,
-    )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
@@ -1373,16 +1338,13 @@ def run_tcn_split(
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
-        predictions=memory_gating_input,
+        predictions=baseline_predictions,
         target_channels=args.target_channels,
         memory_bank=memory_bank,
         half_window=resolved_args["half_window"],
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions = ((gated_predictions[args.target_channels] | preserved_predictions[args.target_channels]).astype(np.uint8)).reindex(
-        columns=args.target_channels
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
