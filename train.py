@@ -205,9 +205,9 @@ class TcnTrainingConfig:
     reconstruction_loss_weight: float = 0.5
     forecast_score_weight: float = 1.0
     reconstruction_score_weight: float = 0.35
-    score_min_weight: float = 0.15
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
+    threshold_quantile_floor: float = 0.95
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
@@ -575,10 +575,9 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
-        forecast_component = self.config.forecast_score_weight * forecast_scores
-        reconstruction_component = self.config.reconstruction_score_weight * recon_scores
-        combined = xp.maximum(forecast_component, reconstruction_component) + (
-            self.config.score_min_weight * xp.minimum(forecast_component, reconstruction_component)
+        combined = (
+            self.config.forecast_score_weight * forecast_scores
+            + self.config.reconstruction_score_weight * recon_scores
         )
         covered = (forecast_count > 0) | (recon_count > 0)
 
@@ -840,7 +839,15 @@ class TcnAnomalyPipeline:
                 min_periods=max(16, self.config.threshold_window // 8),
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
-            threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
+            rolling_quantile = threshold_source.rolling(
+                self.config.threshold_window,
+                min_periods=max(16, self.config.threshold_window // 8),
+            ).quantile(self.config.threshold_quantile_floor)
+            threshold = np.maximum(
+                dynamic_threshold.fillna(global_thresholds[channel_index]),
+                rolling_quantile.fillna(global_thresholds[channel_index]),
+            )
+            threshold = np.maximum(threshold, global_thresholds[channel_index])
             raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
@@ -996,6 +1003,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
+    "tcn_threshold_quantile_floor": 0.95,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
@@ -1005,7 +1013,6 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_preload_dataset": True,
     "tcn_preload_max_gb": 8.0,
     "tcn_training_wall_seconds": 900.0,
-    "tcn_score_min_weight": 0.15,
 }
 
 DEFAULT_MEMORY_ARGS: dict[str, Any] = {
@@ -1066,6 +1073,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TCN_ARGS["tcn_threshold_std_factor"],
     )
     parser.add_argument(
+        "--tcn-threshold-quantile-floor",
+        type=float,
+        default=DEFAULT_TCN_ARGS["tcn_threshold_quantile_floor"],
+    )
+    parser.add_argument(
         "--tcn-calibration-quantile",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_calibration_quantile"],
@@ -1087,12 +1099,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tcn-device", type=str, default=DEFAULT_TCN_ARGS["tcn_device"])
     parser.add_argument("--tcn-dataloader-workers", type=int, default=DEFAULT_TCN_ARGS["tcn_dataloader_workers"])
-    parser.add_argument(
-        "--tcn-score-min-weight",
-        type=float,
-        default=DEFAULT_TCN_ARGS["tcn_score_min_weight"],
-        help="Fraction of the weaker score component retained after max-dominant fusion.",
-    )
     parser.add_argument(
         "--tcn-preload-max-gb",
         type=float,
@@ -1165,9 +1171,9 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         mask_ratio=resolved["tcn_mask_ratio"],
         train_stride=resolved["tcn_train_stride"],
         inference_stride=resolved["tcn_inference_stride"],
-        score_min_weight=resolved["tcn_score_min_weight"],
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
+        threshold_quantile_floor=resolved["tcn_threshold_quantile_floor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
