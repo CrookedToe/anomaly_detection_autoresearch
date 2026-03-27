@@ -993,7 +993,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_train_stride": 8,
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
-    "tcn_threshold_std_factor": 4.0,
+    "tcn_threshold_std_factor": 3.8,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
@@ -1506,55 +1506,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def restore_strong_near_threshold_suppressions(
-    suppressed_events: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    baseline_predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    memory_threshold: float,
-    max_memory_margin: float,
-    min_run_points: int,
-    min_peak_ratio: float,
-    min_other_support: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
-
-    restored = gated_predictions.copy()
-    remaining_mask = np.ones(len(suppressed_events), dtype=bool)
-    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-    baseline_values = baseline_predictions[target_channels]
-
-    for row_index, row in enumerate(suppressed_events.itertuples(index=False)):
-        try:
-            channel_index = target_channels.index(row.channel)
-        except ValueError:
-            continue
-
-        if float(row.score) > (memory_threshold + max_memory_margin):
-            continue
-
-        run_scores = scores.loc[row.start_time : row.end_time, row.channel]
-        if run_scores.empty:
-            continue
-
-        run_length = len(run_scores)
-        peak_ratio = float(run_scores.max()) / float(thresholds[channel_index])
-        support_frame = baseline_values.loc[row.start_time : row.end_time].copy()
-        support_frame[row.channel] = 0
-        other_support = float(support_frame.sum(axis=1).mean()) if not support_frame.empty else 0.0
-
-        if run_length < min_run_points or peak_ratio < min_peak_ratio or other_support < min_other_support:
-            continue
-
-        restored.loc[row.start_time : row.end_time, row.channel] = baseline_predictions.loc[row.start_time : row.end_time, row.channel]
-        remaining_mask[row_index] = False
-
-    return restored, suppressed_events.loc[remaining_mask].reset_index(drop=True)
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1642,19 +1593,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_strong_near_threshold_suppressions(
-        suppressed_events=suppressed_events,
-        gated_predictions=gated_predictions,
-        baseline_predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        memory_threshold=resolved_args["memory_threshold"],
-        max_memory_margin=0.02,
-        min_run_points=48,
-        min_peak_ratio=2.5,
-        min_other_support=2.5,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
