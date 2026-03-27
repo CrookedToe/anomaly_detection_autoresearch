@@ -1399,52 +1399,6 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def extend_strong_run_starts(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_run_peak_ratio: float,
-    start_score_ratio: float,
-    extra_pre_points: int,
-) -> pd.DataFrame:
-    extended = predictions.copy()
-    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = float(thresholds[channel_index])
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-
-            if run_start == 0:
-                continue
-            if channel_scores[run_start - 1] < (threshold * start_score_ratio):
-                continue
-
-            run_peak_ratio = float(channel_scores[run_start:index].max()) / threshold
-            if run_peak_ratio < min_run_peak_ratio:
-                continue
-
-            extend_start = max(0, run_start - max(0, extra_pre_points))
-            series[extend_start:run_start] = 1
-
-        extended[channel] = series
-
-    return extended
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1507,6 +1461,64 @@ def prune_noisy_channel_short_runs(
         pruned[channel] = series
 
     return pruned
+
+
+def restore_cross_channel_consensus_gated_runs(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_run_points: int,
+    min_other_channels: int,
+    min_other_fraction: float,
+    min_peak_ratio: float,
+) -> pd.DataFrame:
+    restored = gated_predictions.copy()
+    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    restored_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
+
+    for channel_index, channel in enumerate(target_channels):
+        baseline_series = baseline_values[:, channel_index]
+        restored_series = restored_values[:, channel_index]
+        channel_scores = score_values[:, channel_index]
+        threshold = float(thresholds[channel_index])
+        index = 0
+
+        while index < len(baseline_series):
+            if baseline_series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(baseline_series) and baseline_series[index] == 1:
+                index += 1
+            run_stop = index
+
+            if (run_stop - run_start) < min_run_points:
+                continue
+            if restored_series[run_start:run_stop].any():
+                continue
+
+            support = baseline_values[run_start:run_stop].copy()
+            support[:, channel_index] = 0
+            channels_with_support = int((support.sum(axis=0) > 0).sum())
+            support_fraction = float((support > 0).mean())
+            peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+
+            if channels_with_support < min_other_channels:
+                continue
+            if support_fraction < min_other_fraction:
+                continue
+            if peak_ratio < min_peak_ratio:
+                continue
+            restored_series[run_start:run_stop] = 1
+
+        restored[channel] = restored_series
+
+    return restored
 
 
 def apply_same_channel_memory_gating(
@@ -1603,15 +1615,6 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = extend_strong_run_starts(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_run_peak_ratio=2.5,
-        start_score_ratio=0.85,
-        extra_pre_points=1,
-    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1648,6 +1651,17 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = restore_cross_channel_consensus_gated_runs(
+        baseline_predictions=baseline_predictions,
+        gated_predictions=gated_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_run_points=4,
+        min_other_channels=3,
+        min_other_fraction=0.2,
+        min_peak_ratio=1.5,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
