@@ -1367,69 +1367,6 @@ def extend_high_confidence_run_edges(
     return extended
 
 
-def bridge_confident_score_gaps(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    max_gap_points: int,
-    min_neighbor_peak_ratio: float,
-    min_gap_score_ratio: float,
-) -> pd.DataFrame:
-    bridged = predictions.copy()
-    prediction_values = bridged[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            left_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            left_stop = index
-            gap_start = index
-
-            while index < len(series) and series[index] == 0:
-                index += 1
-            gap_stop = index
-
-            if gap_start == 0 or gap_stop >= len(series):
-                continue
-
-            gap_length = gap_stop - gap_start
-            if gap_length == 0 or gap_length > max_gap_points or series[gap_stop] != 1:
-                continue
-
-            right_start = gap_stop
-            while index < len(series) and series[index] == 1:
-                index += 1
-            right_stop = index
-
-            left_peak = float(channel_scores[left_start:left_stop].max())
-            right_peak = float(channel_scores[right_start:right_stop].max())
-            if left_peak < (threshold * min_neighbor_peak_ratio) or right_peak < (threshold * min_neighbor_peak_ratio):
-                continue
-
-            gap_peak = float(channel_scores[gap_start:gap_stop].max())
-            if gap_peak < (threshold * min_gap_score_ratio):
-                continue
-
-            series[gap_start:gap_stop] = 1
-
-        bridged[channel] = series
-
-    return bridged
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1581,15 +1518,6 @@ def run_tcn_split(
         min_run_peak_ratio=1.15,
         extension_score_ratio=0.8,
         max_extension_points=6,
-    )
-    baseline_predictions = bridge_confident_score_gaps(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_gap_points=6,
-        min_neighbor_peak_ratio=1.1,
-        min_gap_score_ratio=0.72,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
