@@ -1399,59 +1399,6 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def extend_supported_run_tails(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    support_padding: int,
-    min_run_peak_ratio: float,
-    tail_score_ratio: float,
-    max_extension_points: int,
-) -> pd.DataFrame:
-    extended = predictions.copy()
-    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
-
-            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if run_peak_ratio < min_run_peak_ratio:
-                continue
-
-            extension_stop = run_stop
-            while extension_stop < len(series) and (extension_stop - run_stop) < max_extension_points:
-                if series[extension_stop] == 1 or channel_scores[extension_stop] < (threshold * tail_score_ratio):
-                    break
-                support_start = max(0, extension_stop - support_padding)
-                support_stop = min(len(series), extension_stop + support_padding + 1)
-                support = prediction_values[support_start:support_stop].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    break
-                series[extension_stop] = 1
-                extension_stop += 1
-
-        extended[channel] = series
-
-    return extended
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1609,16 +1556,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         pre_points=1,
         post_points=0,
-    )
-    baseline_predictions = extend_supported_run_tails(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        min_run_peak_ratio=1.1,
-        tail_score_ratio=0.75,
-        max_extension_points=2,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
