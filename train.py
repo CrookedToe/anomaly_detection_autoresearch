@@ -1463,58 +1463,6 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def restore_supported_latent_score_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_support_channels: int,
-    min_support_ratio: float,
-    min_segment_points: int,
-    min_channel_mean_ratio: float,
-    min_channel_peak_ratio: float,
-) -> pd.DataFrame:
-    restored = predictions.copy()
-    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-    score_ratios = score_values / thresholds.reshape(1, -1)
-    support_counts = (score_ratios >= min_support_ratio).sum(axis=1)
-
-    index = 0
-    while index < len(prediction_values):
-        if support_counts[index] < min_support_channels:
-            index += 1
-            continue
-
-        segment_start = index
-        while index < len(prediction_values) and support_counts[index] >= min_support_channels:
-            index += 1
-        segment_stop = index
-
-        if (segment_stop - segment_start) < min_segment_points:
-            continue
-
-        segment_ratios = score_ratios[segment_start:segment_stop]
-        segment_support = segment_ratios >= min_support_ratio
-        channel_mean_ratio = segment_ratios.mean(axis=0)
-        channel_peak_ratio = segment_ratios.max(axis=0)
-        channel_support_fraction = segment_support.mean(axis=0)
-
-        for channel_index in range(len(target_channels)):
-            if channel_support_fraction[channel_index] < 0.5:
-                continue
-            if channel_mean_ratio[channel_index] < min_channel_mean_ratio:
-                continue
-            if channel_peak_ratio[channel_index] < min_channel_peak_ratio:
-                continue
-            prediction_values[segment_start:segment_stop, channel_index] = 1
-
-    for channel_index, channel in enumerate(target_channels):
-        restored[channel] = prediction_values[:, channel_index]
-    return restored
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1619,17 +1567,6 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
-    )
-    baseline_predictions = restore_supported_latent_score_runs(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_support_channels=4,
-        min_support_ratio=0.9,
-        min_segment_points=12,
-        min_channel_mean_ratio=0.95,
-        min_channel_peak_ratio=1.2,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
