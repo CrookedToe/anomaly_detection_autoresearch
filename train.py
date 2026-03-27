@@ -1399,26 +1399,29 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def extend_strong_run_starts_by_score(
+def backfill_supported_multichannel_onsets(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
+    onset_window_points: int,
+    min_support_channels: int,
+    min_run_points: int,
     min_run_peak_ratio: float,
-    pre_start_score_ratio: float,
-    max_extra_pre_points: int,
+    pre_onset_score_ratio: float,
+    max_backfill_points: int,
 ) -> pd.DataFrame:
-    extended = predictions.copy()
-    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    backfilled = predictions.copy()
+    prediction_values = backfilled[target_channels].to_numpy(dtype=np.uint8, copy=True)
     score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
     thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
+    run_records: list[tuple[int, int, int, float]] = []
+    for channel_index in range(len(target_channels)):
+        series = prediction_values[:, channel_index]
         channel_scores = score_values[:, channel_index]
         threshold = max(float(thresholds[channel_index]), EPSILON)
         index = 0
-
         while index < len(series):
             if series[index] != 1:
                 index += 1
@@ -1428,23 +1431,61 @@ def extend_strong_run_starts_by_score(
             while index < len(series) and series[index] == 1:
                 index += 1
             run_stop = index
-
-            if float(channel_scores[run_start:run_stop].max()) < (threshold * min_run_peak_ratio):
+            run_length = run_stop - run_start
+            if run_length < min_run_points:
                 continue
 
-            extra_start = run_start
-            while extra_start > 0 and (run_start - extra_start) < max_extra_pre_points:
-                candidate_index = extra_start - 1
-                if series[candidate_index] == 1 or channel_scores[candidate_index] < (threshold * pre_start_score_ratio):
-                    break
-                extra_start -= 1
+            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+            if run_peak_ratio < min_run_peak_ratio:
+                continue
+            run_records.append((run_start, run_stop, channel_index, run_peak_ratio))
 
-            if extra_start < run_start:
-                series[extra_start:run_start] = 1
+    if len(run_records) < min_support_channels:
+        return backfilled
 
-        extended[channel] = series
+    run_records.sort(key=lambda record: record[0])
+    consumed_starts: set[tuple[int, int]] = set()
 
-    return extended
+    for record_index, (anchor_start, _, _, _) in enumerate(run_records):
+        if (anchor_start, record_index) in consumed_starts:
+            continue
+
+        group: list[tuple[int, int, int, float]] = []
+        seen_channels: set[int] = set()
+        for candidate_index in range(record_index, len(run_records)):
+            run_start, run_stop, channel_index, run_peak_ratio = run_records[candidate_index]
+            if run_start > anchor_start + onset_window_points:
+                break
+            if channel_index in seen_channels:
+                continue
+            group.append((run_start, run_stop, channel_index, run_peak_ratio))
+            seen_channels.add(channel_index)
+            consumed_starts.add((run_start, candidate_index))
+
+        if len(group) < min_support_channels:
+            continue
+
+        earliest_start = min(run_start for run_start, _, _, _ in group)
+        latest_start = max(run_start for run_start, _, _, _ in group)
+        group_floor = max(0, earliest_start - max_backfill_points)
+
+        for backfill_index in range(earliest_start - 1, group_floor - 1, -1):
+            supported_channels = [
+                channel_index
+                for run_start, _, channel_index, _ in group
+                if run_start >= earliest_start
+                and prediction_values[backfill_index, channel_index] == 0
+                and score_values[backfill_index, channel_index]
+                >= (max(float(thresholds[channel_index]), EPSILON) * pre_onset_score_ratio)
+            ]
+            if len(supported_channels) < min_support_channels:
+                break
+            for channel_index in supported_channels:
+                prediction_values[backfill_index:latest_start, channel_index] = 1
+
+    for channel_index, channel in enumerate(target_channels):
+        backfilled[channel] = prediction_values[:, channel_index]
+    return backfilled
 
 
 def prune_noisy_channel_short_runs(
@@ -1605,14 +1646,17 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = extend_strong_run_starts_by_score(
+    baseline_predictions = backfill_supported_multichannel_onsets(
         predictions=baseline_predictions,
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_run_peak_ratio=1.2,
-        pre_start_score_ratio=0.92,
-        max_extra_pre_points=1,
+        onset_window_points=8,
+        min_support_channels=4,
+        min_run_points=24,
+        min_run_peak_ratio=1.1,
+        pre_onset_score_ratio=0.75,
+        max_backfill_points=48,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
