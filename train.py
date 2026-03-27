@@ -1399,24 +1399,20 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def extend_strong_short_run_tails(
+def prune_late_join_hitchhiker_runs(
     predictions: pd.DataFrame,
-    scores: pd.DataFrame,
     target_channels: list[str],
-    global_thresholds: np.ndarray,
     max_run_points: int,
-    min_peak_ratio: float,
-    post_points: int,
+    pre_points: int,
+    min_other_active_points: int,
+    min_other_active_channels: int,
 ) -> pd.DataFrame:
-    extended = predictions.copy()
-    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
 
     for channel_index, channel in enumerate(target_channels):
         series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
+        other_values = np.delete(prediction_values, channel_index, axis=1)
         index = 0
 
         while index < len(series):
@@ -1430,16 +1426,24 @@ def extend_strong_short_run_tails(
             run_stop = index
 
             run_length = run_stop - run_start
-            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if run_length > max_run_points or run_peak_ratio < min_peak_ratio:
+            if run_length > max_run_points or run_start < pre_points:
                 continue
 
-            extend_stop = min(len(series), run_stop + max(0, post_points))
-            series[run_stop:extend_stop] = 1
+            pre_support = other_values[run_start - pre_points : run_start].sum(axis=1)
+            if len(pre_support) < pre_points:
+                continue
+            if int(other_values[run_start].sum()) < min_other_active_channels:
+                continue
+            if (pre_support < min_other_active_channels).any():
+                continue
+            if int(pre_support.sum()) < min_other_active_points:
+                continue
 
-        extended[channel] = series
+            series[run_start:run_stop] = 0
 
-    return extended
+        pruned[channel] = series
+
+    return pruned
 
 
 def prune_noisy_channel_short_runs(
@@ -1600,14 +1604,13 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = extend_strong_short_run_tails(
+    baseline_predictions = prune_late_join_hitchhiker_runs(
         predictions=baseline_predictions,
-        scores=baseline_scores,
         target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_run_points=6,
-        min_peak_ratio=1.6,
-        post_points=1,
+        max_run_points=12,
+        pre_points=8,
+        min_other_active_points=28,
+        min_other_active_channels=4,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
