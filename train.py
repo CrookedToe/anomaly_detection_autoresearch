@@ -1555,7 +1555,7 @@ def run_tcn_split(
         predictions=baseline_predictions,
         target_channels=args.target_channels,
         pre_points=1,
-        post_points=0,
+        post_points=1,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
