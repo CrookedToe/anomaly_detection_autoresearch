@@ -609,9 +609,12 @@ class TcnAnomalyPipeline:
                 batch_windows = windows[batch_start : batch_start + batch_size]
                 if isinstance(batch_windows, np.ndarray):
                     window_values = np.asarray(batch_windows, dtype=np.float32)
+                    if np.isnan(window_values).any():
+                        fill_values = self.scaler.raw_mean.reshape(1, 1, -1)
+                        window_values = np.where(np.isnan(window_values), fill_values, window_values)
                     flattened = window_values.reshape(-1, window_values.shape[-1])
                     raw_normalized = ((flattened - self.scaler.raw_mean) / self.scaler.raw_std).reshape(window_values.shape)
-                    range_dt_seconds = np.float32(1e-9)
+                    range_dt_seconds = np.float32(self.scaler.nominal_dt_seconds)
                     normalized_dt_value = np.float32((range_dt_seconds - self.scaler.dt_mean) / self.scaler.dt_std)
                     dt_template = np.full(
                         (len(window_values), window_values.shape[1], 1),
