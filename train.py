@@ -597,12 +597,12 @@ class TcnAnomalyPipeline:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before vectorizing windows.")
         if len(windows) == 0:
-            vector_dim = self.config.embedding_dim + (len(self.target_channels) * 4)
-            return np.zeros((0, vector_dim), dtype=np.float32)
+            embedding_dim = self.config.embedding_dim
+            return np.zeros((0, embedding_dim), dtype=np.float32)
 
         self.model.eval()
         batch_size = max(1, self.config.batch_size)
-        vectors: list[np.ndarray] = []
+        embeddings: list[np.ndarray] = []
 
         with torch.no_grad():
             for batch_start in range(0, len(windows), batch_size):
@@ -625,46 +625,21 @@ class TcnAnomalyPipeline:
                     base_features = np.concatenate([raw_normalized, dt_template, gap_template], axis=2).astype(np.float32)
                     mask_indicator = np.zeros((len(window_values), window_values.shape[1], 1), dtype=np.float32)
                     model_inputs = np.concatenate([base_features, mask_indicator], axis=2)
-                    summary_features = np.concatenate(
-                        [
-                            raw_normalized.mean(axis=1),
-                            raw_normalized.std(axis=1),
-                            raw_normalized.min(axis=1),
-                            raw_normalized.max(axis=1),
-                        ],
-                        axis=1,
-                    ).astype(np.float32)
                 else:
                     model_inputs_list: list[np.ndarray] = []
-                    summary_features_list: list[np.ndarray] = []
                     for window in batch_windows:
                         padded = self._pad_or_trim_window(window)
                         base_features, _ = self._transform_frame(padded)
                         mask_indicator = np.zeros((len(base_features), 1), dtype=np.float32)
                         model_inputs_list.append(np.concatenate([base_features, mask_indicator], axis=1))
-                        raw_block = base_features[:, : len(self.target_channels)]
-                        summary_features_list.append(
-                            np.concatenate(
-                                [
-                                    raw_block.mean(axis=0),
-                                    raw_block.std(axis=0),
-                                    raw_block.min(axis=0),
-                                    raw_block.max(axis=0),
-                                ]
-                            ).astype(np.float32)
-                        )
                     model_inputs = np.asarray(model_inputs_list, dtype=np.float32)
-                    summary_features = np.asarray(summary_features_list, dtype=np.float32)
 
                 tensor = torch.from_numpy(np.asarray(model_inputs, dtype=np.float32)).float().to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     _, _, embedding = self.model(tensor)
-                embedding_values = embedding.cpu().numpy().astype(np.float32)
-                combined = np.concatenate([embedding_values, summary_features], axis=1)
-                combined_norms = np.linalg.norm(combined, axis=1, keepdims=True)
-                vectors.append(combined / np.where(combined_norms > 0.0, combined_norms, 1.0))
+                embeddings.append(embedding.cpu().numpy().astype(np.float32))
 
-        return np.concatenate(vectors, axis=0).astype(np.float32)
+        return np.concatenate(embeddings, axis=0)
 
     def save(self, path: Path, metadata: dict[str, Any]) -> None:
         if self.model is None or self.scaler is None:
@@ -1499,6 +1474,111 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def select_weak_isolated_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    max_peak_ratio: float,
+    support_padding: int,
+) -> pd.DataFrame:
+    weak_predictions = pd.DataFrame(0, index=predictions.index, columns=target_channels, dtype=np.uint8)
+    prediction_values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index]
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            run_length = run_stop - run_start
+            if run_length <= max_run_points:
+                peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+                if peak_ratio <= max_peak_ratio:
+                    support_start = max(0, run_start - support_padding)
+                    support_stop = min(len(series), run_stop + support_padding)
+                    support = prediction_values[support_start:support_stop].copy()
+                    support[:, channel_index] = 0
+                    if not support.any():
+                        weak_predictions.iloc[run_start:run_stop, channel_index] = 1
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            run_length = run_stop - run_start
+            if run_length <= max_run_points:
+                peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+                if peak_ratio <= max_peak_ratio:
+                    support_start = max(0, run_start - support_padding)
+                    support_stop = min(len(series), run_stop + support_padding)
+                    support = prediction_values[support_start:support_stop].copy()
+                    support[:, channel_index] = 0
+                    if not support.any():
+                        weak_predictions.iloc[run_start:run_stop, channel_index] = 1
+
+    return weak_predictions
+
+
+def apply_relaxed_memory_gating_to_weak_runs(
+    frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    memory_bank: RareNominalMemoryBank,
+    half_window: int,
+    metric: str,
+    relaxed_threshold: float,
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    max_peak_ratio: float,
+    support_padding: int,
+    vectorizer: Any | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    weak_predictions = select_weak_isolated_runs(
+        predictions=predictions,
+        scores=scores,
+        target_channels=target_channels,
+        global_thresholds=global_thresholds,
+        max_run_points=max_run_points,
+        max_peak_ratio=max_peak_ratio,
+        support_padding=support_padding,
+    )
+    if int(weak_predictions.to_numpy(dtype=np.uint8, copy=False).sum()) == 0:
+        return predictions, pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
+
+    weak_gated, weak_suppressed = apply_same_channel_memory_gating(
+        frame=frame,
+        predictions=weak_predictions,
+        target_channels=target_channels,
+        memory_bank=memory_bank,
+        half_window=half_window,
+        metric=metric,
+        threshold=relaxed_threshold,
+        vectorizer=vectorizer,
+    )
+    if weak_suppressed.empty:
+        return predictions, weak_suppressed
+
+    relaxed_gated = predictions.copy()
+    weak_values = weak_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    weak_gated_values = weak_gated[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    relaxed_values = relaxed_gated[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    relaxed_values[(weak_values == 1) & (weak_gated_values == 0)] = 0
+    relaxed_gated[target_channels] = relaxed_values
+    return relaxed_gated, weak_suppressed
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1581,6 +1661,23 @@ def run_tcn_split(
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
     )
+    gated_predictions, relaxed_suppressed_events = apply_relaxed_memory_gating_to_weak_runs(
+        frame=test_df,
+        predictions=gated_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        memory_bank=memory_bank,
+        half_window=resolved_args["half_window"],
+        metric=args.metric,
+        relaxed_threshold=0.89,
+        global_thresholds=pipeline.global_thresholds,
+        max_run_points=12,
+        max_peak_ratio=1.35,
+        support_padding=8,
+        vectorizer=pipeline.vectorize_windows,
+    )
+    if not relaxed_suppressed_events.empty:
+        suppressed_events = pd.concat([suppressed_events, relaxed_suppressed_events], ignore_index=True)
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
     baseline_metrics = compute_esa_metrics(test_labels, baseline_predictions)
