@@ -828,7 +828,7 @@ class TcnAnomalyPipeline:
                 min_periods=1,
             ).max()
             smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
-            threshold_source = rolling_mean.shift(1)
+            threshold_source = smoothed_series.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
@@ -1249,112 +1249,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def extend_supported_run_edges(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray | None,
-    support_padding: int,
-    max_extension_points: int,
-    min_score_ratio: float,
-) -> pd.DataFrame:
-    if global_thresholds is None:
-        return predictions
-
-    extended = predictions.copy()
-    values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
-
-    for channel_index, channel in enumerate(target_channels):
-        base_threshold = float(global_thresholds[channel_index])
-        if base_threshold <= 0.0:
-            continue
-
-        series = values[:, channel_index].copy()
-        channel_scores = scores[channel].to_numpy(dtype=np.float32, copy=False)
-        run_start: int | None = None
-        for index, value in enumerate(series):
-            if value == 1 and run_start is None:
-                run_start = index
-                continue
-            if value == 1:
-                continue
-            if run_start is None:
-                continue
-            series = _extend_run_edges_with_support(
-                series=series,
-                values=values,
-                channel_index=channel_index,
-                channel_scores=channel_scores,
-                run_start=run_start,
-                run_stop=index,
-                base_threshold=base_threshold,
-                support_padding=support_padding,
-                max_extension_points=max_extension_points,
-                min_score_ratio=min_score_ratio,
-            )
-            run_start = None
-
-        if run_start is not None:
-            series = _extend_run_edges_with_support(
-                series=series,
-                values=values,
-                channel_index=channel_index,
-                channel_scores=channel_scores,
-                run_start=run_start,
-                run_stop=len(series),
-                base_threshold=base_threshold,
-                support_padding=support_padding,
-                max_extension_points=max_extension_points,
-                min_score_ratio=min_score_ratio,
-            )
-        extended[channel] = series
-
-    return extended
-
-
-def _extend_run_edges_with_support(
-    series: np.ndarray,
-    values: np.ndarray,
-    channel_index: int,
-    channel_scores: np.ndarray,
-    run_start: int,
-    run_stop: int,
-    base_threshold: float,
-    support_padding: int,
-    max_extension_points: int,
-    min_score_ratio: float,
-) -> np.ndarray:
-    min_score = base_threshold * min_score_ratio
-
-    steps = 0
-    position = run_start - 1
-    while position >= 0 and steps < max_extension_points and series[position] == 0:
-        support_start = max(0, position - support_padding)
-        support_stop = min(len(series), position + support_padding + 1)
-        support = values[support_start:support_stop].copy()
-        support[:, channel_index] = 0
-        if not support.any() or float(channel_scores[position]) < min_score:
-            break
-        series[position] = 1
-        position -= 1
-        steps += 1
-
-    steps = 0
-    position = run_stop
-    while position < len(series) and steps < max_extension_points and series[position] == 0:
-        support_start = max(0, position - support_padding)
-        support_stop = min(len(series), position + support_padding + 1)
-        support = values[support_start:support_stop].copy()
-        support[:, channel_index] = 0
-        if not support.any() or float(channel_scores[position]) < min_score:
-            break
-        series[position] = 1
-        position += 1
-        steps += 1
-
-    return series
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1398,6 +1292,57 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def restore_supported_borderline_suppressions(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    baseline_scores: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray | None,
+    support_padding: int,
+    min_other_channels: int,
+    min_peak_ratio: float,
+    max_match_score: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty or global_thresholds is None:
+        return gated_predictions, suppressed_events
+
+    restored = gated_predictions.copy()
+    threshold_lookup = {channel: float(global_thresholds[index]) for index, channel in enumerate(target_channels)}
+    kept_suppressions: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict("records"):
+        channel = str(row["channel"])
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        match_score = float(row["score"])
+        channel_threshold = threshold_lookup.get(channel, 0.0)
+        if channel_threshold <= 0.0 or match_score > max_match_score:
+            kept_suppressions.append(row)
+            continue
+
+        peak_score = float(baseline_scores.loc[start_time:end_time, channel].max())
+        if peak_score < (channel_threshold * min_peak_ratio):
+            kept_suppressions.append(row)
+            continue
+
+        window_start = max(0, restored.index.get_indexer([start_time], method="nearest")[0] - support_padding)
+        window_stop = min(len(restored.index), restored.index.get_indexer([end_time], method="nearest")[0] + support_padding + 1)
+        support_slice = restored.iloc[window_start:window_stop][target_channels].copy()
+        support_slice[channel] = 0
+        if int(support_slice.sum(axis=1).max()) < min_other_channels:
+            kept_suppressions.append(row)
+            continue
+
+        restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
+
+    if kept_suppressions:
+        filtered_suppressions = pd.DataFrame(kept_suppressions)
+    else:
+        filtered_suppressions = pd.DataFrame(columns=suppressed_events.columns)
+    return restored, filtered_suppressions
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1425,16 +1370,6 @@ def run_tcn_split(
         max_gap_points=8,
         support_padding=8,
     )
-    baseline_predictions = extend_supported_run_edges(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        support_padding=8,
-        max_extension_points=4,
-        min_score_ratio=0.85,
-    )
-
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1460,6 +1395,18 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions, suppressed_events = restore_supported_borderline_suppressions(
+        baseline_predictions=baseline_predictions,
+        gated_predictions=gated_predictions,
+        baseline_scores=baseline_scores,
+        suppressed_events=suppressed_events,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        support_padding=8,
+        min_other_channels=1,
+        min_peak_ratio=1.35,
+        max_match_score=0.955,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
