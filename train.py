@@ -1249,6 +1249,112 @@ def merge_supported_close_runs(
     return merged
 
 
+def extend_supported_run_edges(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray | None,
+    support_padding: int,
+    max_extension_points: int,
+    min_score_ratio: float,
+) -> pd.DataFrame:
+    if global_thresholds is None:
+        return predictions
+
+    extended = predictions.copy()
+    values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        base_threshold = float(global_thresholds[channel_index])
+        if base_threshold <= 0.0:
+            continue
+
+        series = values[:, channel_index].copy()
+        channel_scores = scores[channel].to_numpy(dtype=np.float32, copy=False)
+        run_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 1 and run_start is None:
+                run_start = index
+                continue
+            if value == 1:
+                continue
+            if run_start is None:
+                continue
+            series = _extend_run_edges_with_support(
+                series=series,
+                values=values,
+                channel_index=channel_index,
+                channel_scores=channel_scores,
+                run_start=run_start,
+                run_stop=index,
+                base_threshold=base_threshold,
+                support_padding=support_padding,
+                max_extension_points=max_extension_points,
+                min_score_ratio=min_score_ratio,
+            )
+            run_start = None
+
+        if run_start is not None:
+            series = _extend_run_edges_with_support(
+                series=series,
+                values=values,
+                channel_index=channel_index,
+                channel_scores=channel_scores,
+                run_start=run_start,
+                run_stop=len(series),
+                base_threshold=base_threshold,
+                support_padding=support_padding,
+                max_extension_points=max_extension_points,
+                min_score_ratio=min_score_ratio,
+            )
+        extended[channel] = series
+
+    return extended
+
+
+def _extend_run_edges_with_support(
+    series: np.ndarray,
+    values: np.ndarray,
+    channel_index: int,
+    channel_scores: np.ndarray,
+    run_start: int,
+    run_stop: int,
+    base_threshold: float,
+    support_padding: int,
+    max_extension_points: int,
+    min_score_ratio: float,
+) -> np.ndarray:
+    min_score = base_threshold * min_score_ratio
+
+    steps = 0
+    position = run_start - 1
+    while position >= 0 and steps < max_extension_points and series[position] == 0:
+        support_start = max(0, position - support_padding)
+        support_stop = min(len(series), position + support_padding + 1)
+        support = values[support_start:support_stop].copy()
+        support[:, channel_index] = 0
+        if not support.any() or float(channel_scores[position]) < min_score:
+            break
+        series[position] = 1
+        position -= 1
+        steps += 1
+
+    steps = 0
+    position = run_stop
+    while position < len(series) and steps < max_extension_points and series[position] == 0:
+        support_start = max(0, position - support_padding)
+        support_stop = min(len(series), position + support_padding + 1)
+        support = values[support_start:support_stop].copy()
+        support[:, channel_index] = 0
+        if not support.any() or float(channel_scores[position]) < min_score:
+            break
+        series[position] = 1
+        position += 1
+        steps += 1
+
+    return series
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1318,6 +1424,15 @@ def run_tcn_split(
         target_channels=args.target_channels,
         max_gap_points=8,
         support_padding=8,
+    )
+    baseline_predictions = extend_supported_run_edges(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        support_padding=8,
+        max_extension_points=4,
+        min_score_ratio=0.85,
     )
 
     baseline_dir = args.results_root / "tcn_baseline" / split
