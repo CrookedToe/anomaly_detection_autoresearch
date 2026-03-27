@@ -205,6 +205,7 @@ class TcnTrainingConfig:
     reconstruction_loss_weight: float = 0.5
     forecast_score_weight: float = 1.0
     reconstruction_score_weight: float = 0.35
+    reconstruction_tail_points: int = 4
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
@@ -513,14 +514,22 @@ class TcnAnomalyPipeline:
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     forecast, reconstruction, _ = self.model(model_inputs.to(self.device, non_blocking=True))
                     forecast_error_t = torch.abs(forecast - batch_targets.to(self.device, non_blocking=True)).float()
+                    reconstruction_tail = max(1, min(self.config.reconstruction_tail_points, self.config.sequence_length))
                     reconstruction_error_t = torch.abs(
-                        reconstruction[:, -1, :] - batch_histories[:, -1, :].to(self.device, non_blocking=True)
+                        reconstruction[:, -reconstruction_tail:, :]
+                        - batch_histories[:, -reconstruction_tail:, :].to(self.device, non_blocking=True)
                     ).float()
 
                 if self.cp is not None:
                     forecast_error = self.cp.from_dlpack(forecast_error_t)
                     reconstruction_error = self.cp.from_dlpack(reconstruction_error_t)
-                    anchor_indices = self.cp.asarray(batch_indices + self.config.sequence_length - 1, dtype=self.cp.int64)
+                    reconstruction_indices = (
+                        self.cp.asarray(batch_indices, dtype=self.cp.int64)[:, None]
+                        + self.config.sequence_length
+                        - reconstruction_tail
+                        + self.cp.arange(reconstruction_tail, dtype=self.cp.int64)[None, :]
+                    )
+                    reconstruction_valid = reconstruction_indices < n_rows
                     future_indices = (
                         self.cp.asarray(batch_indices, dtype=self.cp.int64)[:, None]
                         + self.config.sequence_length
@@ -528,8 +537,16 @@ class TcnAnomalyPipeline:
                     )
                     valid_mask = future_indices < n_rows
                     for channel_index in range(target_dim):
-                        self.cp.add.at(recon_sum[:, channel_index], anchor_indices, reconstruction_error[:, channel_index])
-                        self.cp.add.at(recon_count[:, channel_index], anchor_indices, 1.0)
+                        self.cp.add.at(
+                            recon_sum[:, channel_index],
+                            reconstruction_indices[reconstruction_valid],
+                            reconstruction_error[:, :, channel_index][reconstruction_valid],
+                        )
+                        self.cp.add.at(
+                            recon_count[:, channel_index],
+                            reconstruction_indices[reconstruction_valid],
+                            1.0,
+                        )
                         self.cp.add.at(
                             forecast_sum[:, channel_index],
                             future_indices[valid_mask],
@@ -543,10 +560,14 @@ class TcnAnomalyPipeline:
                 else:
                     forecast_error = forecast_error_t.cpu().numpy()
                     reconstruction_error = reconstruction_error_t.cpu().numpy()
+                    reconstruction_start = self.config.sequence_length - reconstruction_tail
                     for row_index, start in enumerate(batch_indices):
-                        anchor_index = int(start + self.config.sequence_length - 1)
-                        recon_sum[anchor_index] += reconstruction_error[row_index]
-                        recon_count[anchor_index] += 1.0
+                        for tail_offset in range(reconstruction_tail):
+                            reconstruction_index = int(start + reconstruction_start + tail_offset)
+                            if reconstruction_index >= n_rows:
+                                break
+                            recon_sum[reconstruction_index] += reconstruction_error[row_index, tail_offset]
+                            recon_count[reconstruction_index] += 1.0
 
                         future_indices = range(
                             int(start + self.config.sequence_length),
@@ -727,18 +748,14 @@ class TcnAnomalyPipeline:
         reconstruction_targets: torch.Tensor,
         reconstruction_mask: torch.Tensor,
     ) -> torch.Tensor:
-        forecast_loss = F.smooth_l1_loss(forecast, forecast_targets)
+        forecast_loss = torch.mean((forecast - forecast_targets) ** 2)
 
-        reconstruction_error = F.smooth_l1_loss(
-            reconstruction,
-            reconstruction_targets,
-            reduction="none",
-        )
-        masked_error = reconstruction_error * reconstruction_mask
+        squared_error = (reconstruction - reconstruction_targets) ** 2
+        masked_error = squared_error * reconstruction_mask
         if reconstruction_mask.sum() > 0:
             reconstruction_loss = masked_error.sum() / reconstruction_mask.sum()
         else:
-            reconstruction_loss = reconstruction_error.mean()
+            reconstruction_loss = squared_error.mean()
 
         return (
             self.config.forecast_loss_weight * forecast_loss
