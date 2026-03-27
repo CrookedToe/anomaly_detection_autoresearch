@@ -1367,6 +1367,70 @@ def extend_high_confidence_run_edges(
     return extended
 
 
+def prune_noisy_channel_short_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    support_padding: int,
+    noisy_run_median_threshold: float,
+    noisy_peak_ratio_median_threshold: float,
+    min_run_points: int,
+    max_short_run_peak_ratio: float,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        runs: list[tuple[int, int, int, float]] = []
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
+
+        if not runs:
+            continue
+
+        median_run_length = float(np.median([run[2] for run in runs]))
+        median_peak_ratio = float(np.median([run[3] for run in runs]))
+        if median_run_length > noisy_run_median_threshold or median_peak_ratio > noisy_peak_ratio_median_threshold:
+            continue
+
+        for run_start, run_stop, run_length, peak_ratio in runs:
+            if run_length >= min_run_points or peak_ratio > max_short_run_peak_ratio:
+                continue
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = prediction_values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            if support.any():
+                continue
+            series[run_start:run_stop] = 0
+
+        pruned[channel] = series
+
+    return pruned
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1454,6 +1518,17 @@ def run_tcn_split(
         min_run_peak_ratio=1.15,
         extension_score_ratio=0.8,
         max_extension_points=6,
+    )
+    baseline_predictions = prune_noisy_channel_short_runs(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        support_padding=8,
+        noisy_run_median_threshold=8.0,
+        noisy_peak_ratio_median_threshold=1.2,
+        min_run_points=6,
+        max_short_run_peak_ratio=1.35,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
