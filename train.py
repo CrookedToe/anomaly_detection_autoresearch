@@ -209,7 +209,7 @@ class TcnTrainingConfig:
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
-    min_anomaly_run_length: int = 5
+    min_anomaly_run_length: int = 8
     max_gap_fill: int = 2
     validation_fraction: float = 0.1
     random_seed: int = 42
@@ -828,7 +828,7 @@ class TcnAnomalyPipeline:
                 min_periods=1,
             ).max()
             smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
-            threshold_source = rolling_mean.shift(1)
+            threshold_source = smoothed_series.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
@@ -996,7 +996,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
-    "tcn_min_anomaly_run_length": 5,
+    "tcn_min_anomaly_run_length": 8,
     "tcn_max_gap_fill": 2,
     "tcn_device": "cuda",
     "tcn_dataloader_workers": 8,
