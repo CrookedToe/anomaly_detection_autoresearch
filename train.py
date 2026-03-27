@@ -1367,6 +1367,38 @@ def extend_high_confidence_run_edges(
     return extended
 
 
+def expand_prediction_run_boundaries(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    pre_points: int,
+    post_points: int,
+) -> pd.DataFrame:
+    expanded = predictions.copy()
+    prediction_values = expanded[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            expand_start = max(0, run_start - max(0, pre_points))
+            expand_stop = min(len(series), run_stop + max(0, post_points))
+            series[expand_start:expand_stop] = 1
+
+        expanded[channel] = series
+
+    return expanded
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1518,6 +1550,12 @@ def run_tcn_split(
         min_run_peak_ratio=1.15,
         extension_score_ratio=0.8,
         max_extension_points=6,
+    )
+    baseline_predictions = expand_prediction_run_boundaries(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        pre_points=1,
+        post_points=0,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
