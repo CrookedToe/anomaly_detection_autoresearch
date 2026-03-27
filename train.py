@@ -207,7 +207,7 @@ class TcnTrainingConfig:
     reconstruction_score_weight: float = 0.35
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
-    calibration_quantile: float = 0.997
+    calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
     max_gap_fill: int = 2
@@ -989,7 +989,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
-    "tcn_calibration_quantile": 0.997,
+    "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
     "tcn_max_gap_fill": 2,
