@@ -1399,95 +1399,6 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def backfill_supported_multichannel_onsets(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    onset_window_points: int,
-    min_support_channels: int,
-    min_run_points: int,
-    min_run_peak_ratio: float,
-    pre_onset_score_ratio: float,
-    max_backfill_points: int,
-) -> pd.DataFrame:
-    backfilled = predictions.copy()
-    prediction_values = backfilled[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    run_records: list[tuple[int, int, int, float]] = []
-    for channel_index in range(len(target_channels)):
-        series = prediction_values[:, channel_index]
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            run_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            run_stop = index
-            run_length = run_stop - run_start
-            if run_length < min_run_points:
-                continue
-
-            run_peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
-            if run_peak_ratio < min_run_peak_ratio:
-                continue
-            run_records.append((run_start, run_stop, channel_index, run_peak_ratio))
-
-    if len(run_records) < min_support_channels:
-        return backfilled
-
-    run_records.sort(key=lambda record: record[0])
-    consumed_starts: set[tuple[int, int]] = set()
-
-    for record_index, (anchor_start, _, _, _) in enumerate(run_records):
-        if (anchor_start, record_index) in consumed_starts:
-            continue
-
-        group: list[tuple[int, int, int, float]] = []
-        seen_channels: set[int] = set()
-        for candidate_index in range(record_index, len(run_records)):
-            run_start, run_stop, channel_index, run_peak_ratio = run_records[candidate_index]
-            if run_start > anchor_start + onset_window_points:
-                break
-            if channel_index in seen_channels:
-                continue
-            group.append((run_start, run_stop, channel_index, run_peak_ratio))
-            seen_channels.add(channel_index)
-            consumed_starts.add((run_start, candidate_index))
-
-        if len(group) < min_support_channels:
-            continue
-
-        earliest_start = min(run_start for run_start, _, _, _ in group)
-        latest_start = max(run_start for run_start, _, _, _ in group)
-        group_floor = max(0, earliest_start - max_backfill_points)
-
-        for backfill_index in range(earliest_start - 1, group_floor - 1, -1):
-            supported_channels = [
-                channel_index
-                for run_start, _, channel_index, _ in group
-                if run_start >= earliest_start
-                and prediction_values[backfill_index, channel_index] == 0
-                and score_values[backfill_index, channel_index]
-                >= (max(float(thresholds[channel_index]), EPSILON) * pre_onset_score_ratio)
-            ]
-            if len(supported_channels) < min_support_channels:
-                break
-            for channel_index in supported_channels:
-                prediction_values[backfill_index:latest_start, channel_index] = 1
-
-    for channel_index, channel in enumerate(target_channels):
-        backfilled[channel] = prediction_values[:, channel_index]
-    return backfilled
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1595,6 +1506,26 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def restore_ultra_long_suppressed_runs(
+    gated_predictions: pd.DataFrame,
+    baseline_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    min_duration: pd.Timedelta,
+) -> pd.DataFrame:
+    if suppressed_events.empty:
+        return gated_predictions
+
+    restored = gated_predictions.copy()
+    for row in suppressed_events.itertuples(index=False):
+        start_time = pd.Timestamp(row.start_time)
+        end_time = pd.Timestamp(row.end_time)
+        if end_time - start_time < min_duration:
+            continue
+        mask = (restored.index >= start_time) & (restored.index <= end_time)
+        restored.loc[mask, row.channel] = baseline_predictions.loc[mask, row.channel].astype(np.uint8)
+    return restored
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1646,18 +1577,6 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = backfill_supported_multichannel_onsets(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        onset_window_points=8,
-        min_support_channels=4,
-        min_run_points=24,
-        min_run_peak_ratio=1.1,
-        pre_onset_score_ratio=0.75,
-        max_backfill_points=48,
-    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1694,6 +1613,12 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = restore_ultra_long_suppressed_runs(
+        gated_predictions=gated_predictions,
+        baseline_predictions=baseline_predictions,
+        suppressed_events=suppressed_events,
+        min_duration=pd.Timedelta(minutes=50),
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
