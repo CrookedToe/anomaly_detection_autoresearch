@@ -1399,42 +1399,6 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def restore_synchronized_score_onsets(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_channels: int,
-    onset_ratio: float,
-    restore_ratio: float,
-    neighborhood_points: int,
-    restore_points: int,
-) -> pd.DataFrame:
-    restored = predictions.copy()
-    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-    score_ratios = score_values / thresholds.reshape(1, -1)
-    elevated = score_ratios >= onset_ratio
-    rising = elevated.copy()
-    rising[1:] &= ~elevated[:-1]
-
-    for index in np.flatnonzero(rising.sum(axis=1) >= min_channels):
-        left = max(0, index - neighborhood_points)
-        right = min(len(prediction_values), index + neighborhood_points + 1)
-        if prediction_values[left:right].any():
-            continue
-
-        restore_stop = min(len(prediction_values), index + max(1, restore_points))
-        rescue_mask = score_ratios[index:restore_stop].max(axis=0) >= restore_ratio
-        if int(rescue_mask.sum()) < min_channels:
-            continue
-        prediction_values[index:restore_stop, rescue_mask] = 1
-
-    restored[target_channels] = prediction_values
-    return restored
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1542,6 +1506,46 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def restore_duration_mismatched_suppressions(
+    predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    memory_bank: RareNominalMemoryBank,
+    min_duration_ratio: float,
+    max_match_score: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return predictions, suppressed_events
+
+    prototype_duration_seconds: dict[str, float] = {}
+    for prototype in memory_bank.prototypes:
+        start_time = pd.Timestamp(prototype.start_time)
+        end_time = pd.Timestamp(prototype.end_time)
+        prototype_duration_seconds[prototype.prototype_id] = max((end_time - start_time).total_seconds(), 30.0)
+
+    restored = predictions.copy()
+    kept_rows: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict("records"):
+        prototype_duration = prototype_duration_seconds.get(str(row["prototype_id"]))
+        if prototype_duration is None:
+            kept_rows.append(row)
+            continue
+
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        run_duration = max((end_time - start_time).total_seconds(), 30.0)
+        duration_ratio = run_duration / prototype_duration
+        match_score = float(row["score"])
+
+        if duration_ratio >= min_duration_ratio and match_score <= max_match_score:
+            restored.loc[start_time:end_time, str(row["channel"])] = 1
+            continue
+
+        kept_rows.append(row)
+
+    return restored, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1593,17 +1597,6 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = restore_synchronized_score_onsets(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_channels=4,
-        onset_ratio=1.0,
-        restore_ratio=1.1,
-        neighborhood_points=12,
-        restore_points=2,
-    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1640,6 +1633,13 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions, suppressed_events = restore_duration_mismatched_suppressions(
+        predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        memory_bank=memory_bank,
+        min_duration_ratio=4.0,
+        max_match_score=0.94,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
