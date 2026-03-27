@@ -1399,50 +1399,63 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def extend_score_supported_run_tails(
+def bridge_high_score_run_gaps(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
-    min_support_channels: int,
     min_score_ratio: float,
-    max_extension_points: int,
+    max_gap_points: int,
+    min_neighbor_peak_ratio: float,
 ) -> pd.DataFrame:
-    extended = predictions.copy()
-    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    bridged = predictions.copy()
+    prediction_values = bridged[target_channels].to_numpy(dtype=np.uint8, copy=True)
     score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
     thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
         series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
         threshold = max(float(thresholds[channel_index]), EPSILON)
         index = 0
 
         while index < len(series):
-            if series[index] != 1:
+            if series[index] == 1:
                 index += 1
                 continue
 
-            run_stop = index
-            while run_stop < len(series) and series[run_stop] == 1:
-                run_stop += 1
+            gap_start = index
+            while index < len(series) and series[index] == 0:
+                index += 1
+            gap_stop = index
 
-            extension_stop = run_stop
-            while extension_stop < len(series) and (extension_stop - run_stop) < max_extension_points:
-                support = int(prediction_values[extension_stop].sum() - series[extension_stop])
-                if support < min_support_channels:
-                    break
-                if score_values[extension_stop, channel_index] < (threshold * min_score_ratio):
-                    break
-                series[extension_stop] = 1
-                extension_stop += 1
+            gap_length = gap_stop - gap_start
+            if gap_start == 0 or gap_stop >= len(series) or gap_length > max_gap_points:
+                continue
+            if series[gap_start - 1] != 1 or series[gap_stop] != 1:
+                continue
 
-            index = max(run_stop, extension_stop)
+            left_start = gap_start - 1
+            while left_start > 0 and series[left_start - 1] == 1:
+                left_start -= 1
+
+            right_stop = gap_stop + 1
+            while right_stop < len(series) and series[right_stop] == 1:
+                right_stop += 1
+
+            left_peak = float(channel_scores[left_start:gap_start].max())
+            right_peak = float(channel_scores[gap_stop:right_stop].max())
+            if left_peak < (threshold * min_neighbor_peak_ratio) or right_peak < (threshold * min_neighbor_peak_ratio):
+                continue
+            if np.any(channel_scores[gap_start:gap_stop] < (threshold * min_score_ratio)):
+                continue
+
+            series[gap_start:gap_stop] = 1
 
         prediction_values[:, channel_index] = series
 
-    extended[target_channels] = prediction_values
-    return extended
+    bridged[target_channels] = prediction_values
+    return bridged
 
 
 def prune_noisy_channel_short_runs(
@@ -1603,6 +1616,15 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
+    baseline_predictions = bridge_high_score_run_gaps(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_score_ratio=0.8,
+        max_gap_points=2,
+        min_neighbor_peak_ratio=1.05,
+    )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1613,15 +1635,6 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
-    )
-    baseline_predictions = extend_score_supported_run_tails(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_support_channels=3,
-        min_score_ratio=0.9,
-        max_extension_points=1,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
