@@ -828,7 +828,7 @@ class TcnAnomalyPipeline:
                 min_periods=1,
             ).max()
             smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
-            threshold_source = smoothed_series.shift(1)
+            threshold_source = rolling_mean.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
                 min_periods=max(16, self.config.threshold_window // 8),
