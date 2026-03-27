@@ -1399,38 +1399,50 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def restore_cross_channel_consensus_runs(
+def extend_strong_run_starts(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
-    min_consensus_channels: int,
-    consensus_score_ratio: float,
-    channel_score_ratio: float,
-    support_padding: int,
+    min_run_peak_ratio: float,
+    start_score_ratio: float,
+    extra_pre_points: int,
 ) -> pd.DataFrame:
-    restored = predictions.copy()
-    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
     score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
     thresholds = np.maximum(np.asarray(global_thresholds, dtype=np.float32), EPSILON)
-    score_ratios = score_values / thresholds[None, :]
-
-    consensus_mask = (score_ratios >= consensus_score_ratio).sum(axis=1) >= max(1, min_consensus_channels)
-    if consensus_mask.any() and support_padding > 0:
-        support_width = 2 * support_padding + 1
-        consensus_mask = np.convolve(
-            consensus_mask.astype(np.uint8),
-            np.ones(support_width, dtype=np.uint8),
-            mode="same",
-        ) > 0
 
     for channel_index, channel in enumerate(target_channels):
         series = prediction_values[:, channel_index].copy()
-        restore_mask = consensus_mask & (score_ratios[:, channel_index] >= channel_score_ratio)
-        series[restore_mask] = 1
-        restored[channel] = series
+        channel_scores = score_values[:, channel_index]
+        threshold = float(thresholds[channel_index])
+        index = 0
 
-    return restored
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+
+            if run_start == 0:
+                continue
+            if channel_scores[run_start - 1] < (threshold * start_score_ratio):
+                continue
+
+            run_peak_ratio = float(channel_scores[run_start:index].max()) / threshold
+            if run_peak_ratio < min_run_peak_ratio:
+                continue
+
+            extend_start = max(0, run_start - max(0, extra_pre_points))
+            series[extend_start:run_start] = 1
+
+        extended[channel] = series
+
+    return extended
 
 
 def prune_noisy_channel_short_runs(
@@ -1591,15 +1603,14 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
-    baseline_predictions = restore_cross_channel_consensus_runs(
+    baseline_predictions = extend_strong_run_starts(
         predictions=baseline_predictions,
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_consensus_channels=4,
-        consensus_score_ratio=1.0,
-        channel_score_ratio=0.85,
-        support_padding=3,
+        min_run_peak_ratio=2.5,
+        start_score_ratio=0.85,
+        extra_pre_points=1,
     )
     baseline_predictions = prune_noisy_channel_short_runs(
         predictions=baseline_predictions,
