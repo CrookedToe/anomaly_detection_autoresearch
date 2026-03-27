@@ -1399,47 +1399,50 @@ def expand_prediction_run_boundaries(
     return expanded
 
 
-def restore_synchronous_delta_spikes(
+def extend_score_supported_run_tails(
     predictions: pd.DataFrame,
-    frame: pd.DataFrame,
     scores: pd.DataFrame,
     target_channels: list[str],
     global_thresholds: np.ndarray,
     min_support_channels: int,
-    delta_z_threshold: float,
     min_score_ratio: float,
-    padding_points: int,
+    max_extension_points: int,
 ) -> pd.DataFrame:
-    restored = predictions.copy()
-    prediction_values = restored[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    raw_values = frame[target_channels].to_numpy(dtype=np.float32, copy=False)
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
     score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
     thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
-    if len(raw_values) == 0:
-        return restored
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
 
-    delta = np.abs(np.diff(raw_values, axis=0, prepend=raw_values[:1]))
-    channel_medians = np.median(delta, axis=0)
-    channel_mads = np.median(np.abs(delta - channel_medians), axis=0)
-    robust_scale = np.maximum(channel_mads * 1.4826, EPSILON)
-    delta_z = (delta - channel_medians) / robust_scale
-    support = (delta_z >= delta_z_threshold).sum(axis=1)
-
-    for index in np.flatnonzero(support >= min_support_channels):
-        start = max(0, index - max(0, padding_points))
-        stop = min(len(prediction_values), index + max(0, padding_points) + 1)
-        for channel_index in range(len(target_channels)):
-            if delta_z[index, channel_index] < delta_z_threshold:
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
                 continue
-            threshold = max(float(thresholds[channel_index]), EPSILON)
-            local_peak = float(np.max(score_values[start:stop, channel_index])) if stop > start else 0.0
-            if local_peak < (threshold * min_score_ratio):
-                continue
-            prediction_values[start:stop, channel_index] = 1
 
-    restored[target_channels] = prediction_values
-    return restored
+            run_stop = index
+            while run_stop < len(series) and series[run_stop] == 1:
+                run_stop += 1
+
+            extension_stop = run_stop
+            while extension_stop < len(series) and (extension_stop - run_stop) < max_extension_points:
+                support = int(prediction_values[extension_stop].sum() - series[extension_stop])
+                if support < min_support_channels:
+                    break
+                if score_values[extension_stop, channel_index] < (threshold * min_score_ratio):
+                    break
+                series[extension_stop] = 1
+                extension_stop += 1
+
+            index = max(run_stop, extension_stop)
+
+        prediction_values[:, channel_index] = series
+
+    extended[target_channels] = prediction_values
+    return extended
 
 
 def prune_noisy_channel_short_runs(
@@ -1611,16 +1614,14 @@ def run_tcn_split(
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
     )
-    baseline_predictions = restore_synchronous_delta_spikes(
+    baseline_predictions = extend_score_supported_run_tails(
         predictions=baseline_predictions,
-        frame=test_df,
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_support_channels=5,
-        delta_z_threshold=6.0,
-        min_score_ratio=0.8,
-        padding_points=1,
+        min_support_channels=3,
+        min_score_ratio=0.9,
+        max_extension_points=1,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
