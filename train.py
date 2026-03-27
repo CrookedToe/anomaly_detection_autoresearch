@@ -204,7 +204,7 @@ class TcnTrainingConfig:
     forecast_loss_weight: float = 1.0
     reconstruction_loss_weight: float = 0.5
     forecast_score_weight: float = 1.0
-    reconstruction_score_weight: float = 0.35
+    reconstruction_score_weight: float = 0.2
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
