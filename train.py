@@ -1410,6 +1410,39 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
+def restore_high_confidence_suppressed_runs(
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    baseline_scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray | None,
+    min_peak_ratio: float,
+    min_mean_ratio: float,
+) -> pd.DataFrame:
+    if suppressed_events.empty or global_thresholds is None:
+        return gated_predictions
+
+    restored = gated_predictions.copy()
+    threshold_map = {
+        channel: max(float(global_thresholds[channel_index]), EPSILON)
+        for channel_index, channel in enumerate(target_channels)
+    }
+
+    for row in suppressed_events.itertuples(index=False):
+        threshold = threshold_map.get(row.channel)
+        if threshold is None:
+            continue
+        segment = baseline_scores.loc[pd.Timestamp(row.start_time) : pd.Timestamp(row.end_time), row.channel]
+        if segment.empty:
+            continue
+        peak_ratio = float(segment.max()) / threshold
+        mean_ratio = float(segment.mean()) / threshold
+        if peak_ratio >= min_peak_ratio and mean_ratio >= min_mean_ratio:
+            restored.loc[pd.Timestamp(row.start_time) : pd.Timestamp(row.end_time), row.channel] = 1
+
+    return restored
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1480,6 +1513,15 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = restore_high_confidence_suppressed_runs(
+        gated_predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        baseline_scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_peak_ratio=3.0,
+        min_mean_ratio=1.5,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
