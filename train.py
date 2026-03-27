@@ -991,7 +991,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_epochs": 4,
     "tcn_mask_ratio": 0.15,
     "tcn_train_stride": 8,
-    "tcn_inference_stride": 4,
+    "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
@@ -1463,6 +1463,51 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
+def prune_short_low_margin_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    max_peak_ratio: float,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            run_length = run_stop - run_start
+            peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+            if run_length <= max_run_points and peak_ratio <= max_peak_ratio:
+                series[run_start:run_stop] = 0
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            run_length = run_stop - run_start
+            peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+            if run_length <= max_run_points and peak_ratio <= max_peak_ratio:
+                series[run_start:run_stop] = 0
+
+        pruned[channel] = series
+
+    return pruned
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1593,6 +1638,14 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions = prune_short_low_margin_runs(
+        predictions=gated_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        max_run_points=12,
+        max_peak_ratio=5.0,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
