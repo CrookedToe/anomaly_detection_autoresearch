@@ -574,9 +574,11 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
+        agreement_bonus = xp.sqrt(xp.maximum(forecast_scores, 0.0) * xp.maximum(recon_scores, 0.0))
         combined = (
             self.config.forecast_score_weight * forecast_scores
             + self.config.reconstruction_score_weight * recon_scores
+            + (0.25 * agreement_bonus)
         )
         covered = (forecast_count > 0) | (recon_count > 0)
 
@@ -1167,38 +1169,6 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
-def restore_nonisolated_or_long_suppressed_runs(
-    baseline_predictions: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    min_run_points: int,
-    min_active_channels: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
-
-    restored = gated_predictions.copy()
-    kept_suppressions: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict("records"):
-        channel = str(row["channel"])
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        run_slice = baseline_predictions.loc[start_time:end_time]
-        run_length = int(run_slice[channel].sum())
-        concurrent_alerts = run_slice.sum(axis=1)
-        if run_length >= min_run_points or (not concurrent_alerts.empty and int(concurrent_alerts.max()) >= min_active_channels):
-            restored.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
-            continue
-        kept_suppressions.append(row)
-
-    if kept_suppressions:
-        filtered_suppressions = pd.DataFrame(kept_suppressions)
-    else:
-        filtered_suppressions = pd.DataFrame(columns=suppressed_events.columns)
-    return restored, filtered_suppressions
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1240,13 +1210,6 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
-    )
-    gated_predictions, suppressed_events = restore_nonisolated_or_long_suppressed_runs(
-        baseline_predictions=baseline_predictions,
-        gated_predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        min_run_points=20,
-        min_active_channels=2,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
