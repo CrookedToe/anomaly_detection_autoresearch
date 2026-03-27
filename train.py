@@ -44,7 +44,7 @@ from prepare import (
 class TcnModelConfig:
     input_dim: int
     target_dim: int
-    horizon: int = 4
+    horizon: int = 8
     hidden_dim: int = 64
     embedding_dim: int = 64
     kernel_size: int = 3
@@ -188,7 +188,7 @@ class FeatureScaler:
 @dataclass
 class TcnTrainingConfig:
     sequence_length: int = 128
-    horizon: int = 4
+    horizon: int = 8
     hidden_dim: int = 64
     embedding_dim: int = 64
     num_blocks: int = 5
@@ -974,7 +974,7 @@ DEFAULT_AUTORESEARCH_DETECTORS = ["tcn"]
 
 DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_sequence_length": 128,
-    "tcn_horizon": 4,
+    "tcn_horizon": 8,
     "tcn_hidden_dim": 64,
     "tcn_embedding_dim": 64,
     "tcn_num_blocks": 5,
