@@ -14,7 +14,7 @@ To set up a new autonomous research run, work with the user to:
    - `prepare.py` for the fixed harness and evaluation logic
    - `train.py` for the model, scoring path, and experiment surface
    - `program.md` for the operating instructions in this file
-4. Verify data exists under `data/ESA-Mission1/` and `data/preprocessed/`. If the subset CSVs are missing, tell the human to run `.venv/bin/python ingest.py`.
+4. Verify data exists under `data/ESA-Mission1/`, `data/ESA-Mission2/`, and `data/preprocessed/`. If the split CSVs are missing, tell the human to run `.venv/bin/python ingest.py`.
 5. Verify the local virtual environment exists and use `.venv/bin/python` for all benchmark commands.
 6. Initialize `results.tsv` in the repository root if it does not exist, with the header:
    `commit	primary_f05	status	description`
@@ -71,6 +71,12 @@ The default benchmark contract is:
 - split scope: `10_months`
 - TCN wall-clock budget: `900` seconds
 - fixed seeds and comparable data layout unless the human changes the contract
+
+Split naming:
+
+- `10_months` is the quick-training split.
+- `84_months` is the logical Mission1 paper split and resolves to `81_months.train.csv`, `3_months.val.csv`, and `84_months.test.csv`.
+- `21_months` is the logical Mission2 paper split and resolves to `18_months.train.csv`, `3_months.val.csv`, and `21_months.test.csv`.
 
 Because the training budget is fixed, you should focus on improving the metric, not on making runs longer.
 
@@ -138,6 +144,24 @@ b2c3d4e	0.150926	discard	raise memory threshold to 0.94
 c3d4e5f	0.000000	crash	break event scoring path
 ```
 
+## Search Strategy
+
+Do not reduce the search to hyperparameter tuning only.
+
+You should explore across multiple levels of the system:
+
+- training hyperparameters such as learning rate, dropout, weight decay, stride, horizon, and batch behavior
+- score construction and aggregation
+- threshold calibration and thresholding behavior
+- alert persistence, event formation, and fragmentation control
+- memory query and prototype representation
+- memory gating logic and suppression criteria
+- interactions between the learned detector and the memory stage
+
+When one family of ideas has been tried several times in a row, deliberately switch to a different axis. Do not pigeonhole yourself into only threshold tweaks or only optimizer tweaks.
+
+Prefer experiments motivated by a concrete hypothesis about why the current best run is failing. Use `summary.csv`, `run_summary.json`, `metrics_long.csv`, `leaderboard.csv`, and `results.tsv` to identify the next bottleneck.
+
 ## The Experiment Loop
 
 The experiment runs on a dedicated branch such as `autoresearch/mar26`.
@@ -155,8 +179,11 @@ LOOP FOREVER:
 7. Record the result in `results.tsv`.
 8. If `primary_f05` improved, keep the commit and continue from there.
 9. If `primary_f05` is equal or worse, revert to the previous best commit and continue from there.
+10. Immediately choose the next experiment and continue the loop in the same session.
 
 The idea is simple: if a change works, keep it and advance the branch. If it does not work, discard it and keep searching.
+
+Do not treat a local summary, a new best result, a revert, or a clean worktree as a stopping point. Those are normal loop states. Continue immediately.
 
 ## Timeout Policy
 
@@ -187,13 +214,29 @@ Read these materials when you need better ideas. Do not let reading block the ex
 
 Once the loop begins, do not pause to ask the human whether to continue. Do not ask whether this is a good stopping point. Keep iterating until the human explicitly interrupts you.
 
+Do not stop after one experiment, a few experiments, a new best result, or a written progress summary. A summary is not an endpoint. After any summary, immediately resume the next experiment unless the human has explicitly told you to stop.
+
+The default behavior is continuation, not handoff.
+
+If the same unfinished candidate is resumed and there is no live train.py/eval.py process and run.log only contains the startup line, treat it as an infrastructure crash after one retry, record it as crash, restore the previous best state, and move on to a different experiment. Do not retry the same stuck candidate indefinitely.
+
+Only stop for one of these reasons:
+
+- the human explicitly says `stop`
+- the repository becomes unsafe to modify
+- the runtime environment is broken and cannot execute further experiments
+- repeated crashes make further autonomous progress impossible
+
 If you run out of ideas:
 
 - re-read `train.py`
 - re-read recent results
 - inspect failure cases in `metrics_long.csv`
+- inspect `results.tsv` to avoid repeating the same family of experiments
 - revisit thresholding, calibration, event formation, scoring aggregation, query/prototype representation, and memory gating
+- inspect detector-vs-memory tradeoffs instead of only scalar ranking
 - combine near-miss ideas
+- shift to a different search axis if recent experiments are too similar
 - try bolder but still focused changes
 
 The loop is the job.

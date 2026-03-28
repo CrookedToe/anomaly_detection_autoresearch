@@ -639,15 +639,53 @@ def load_dataset_record(preprocessed_root: Path, split: str) -> pd.Series:
     return row.iloc[0]
 
 
-def resolve_dataset_paths(preprocessed_root: Path, split: str) -> tuple[Path, Path]:
+def infer_mission_from_split(split: str) -> str | None:
+    if split in {"84_months", "81_months", "10_months"}:
+        return "ESA-Mission1"
+    if split in {"21_months", "18_months"}:
+        return "ESA-Mission2"
+    return None
+
+
+def resolve_dataset_paths(preprocessed_root: Path, split: str) -> tuple[Path, Path | None, Path]:
     subset_root = preprocessed_root / "multivariate" / "ESA-Mission1-subset-semi-supervised"
     subset_train_path = subset_root / f"{split}.train.csv"
-    subset_test_path = subset_root / "84_months.test.csv"
+    subset_val_path = subset_root / f"{split}.val.csv"
+    subset_test_path = subset_root / f"{split}.test.csv"
     if subset_train_path.exists() and subset_test_path.exists():
-        return subset_train_path, subset_test_path
+        return subset_train_path, subset_val_path if subset_val_path.exists() else None, subset_test_path
+
+    legacy_subset_test_path = subset_root / "84_months.test.csv"
+    if subset_train_path.exists() and legacy_subset_test_path.exists():
+        return subset_train_path, None, legacy_subset_test_path
+
+    mission = infer_mission_from_split(split)
+    if mission is not None:
+        mission_root = preprocessed_root / "multivariate" / f"{mission}-semi-supervised"
+        mission_train_candidates = [mission_root / f"{split}.train.csv"]
+        if split == "84_months":
+            mission_train_candidates.insert(0, mission_root / "81_months.train.csv")
+        elif split == "21_months":
+            mission_train_candidates.insert(0, mission_root / "18_months.train.csv")
+        mission_val_path = mission_root / "3_months.val.csv"
+        mission_test_path = mission_root / f"{split}.test.csv"
+        for mission_train_path in mission_train_candidates:
+            if mission_train_path.exists() and mission_test_path.exists():
+                return mission_train_path, mission_val_path if mission_val_path.exists() else None, mission_test_path
 
     record = load_dataset_record(preprocessed_root, split)
-    return preprocessed_root / Path(record["train_path"]), preprocessed_root / Path(record["test_path"])
+    train_path = preprocessed_root / Path(record["train_path"])
+    test_path = preprocessed_root / Path(record["test_path"])
+    precise_match = re.fullmatch(r"(\d+)_months\.train\.csv", train_path.name)
+    precise_val_path = train_path.with_name("3_months.val.csv")
+    if precise_match and precise_val_path.exists():
+        precise_train_months = int(precise_match.group(1)) - 3
+        precise_train_path = train_path.with_name(f"{precise_train_months}_months.train.csv")
+        if precise_train_path.exists():
+            return precise_train_path, precise_val_path, test_path
+
+    val_path = train_path.with_name(train_path.name.replace(".train.csv", ".val.csv"))
+    return train_path, val_path if val_path.exists() else None, test_path
 
 
 def load_subset_frame(csv_path: Path, target_channels: list[str]) -> pd.DataFrame:
@@ -697,17 +735,27 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def load_split_data(args: argparse.Namespace, split: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_split_data(
+    args: argparse.Namespace, split: str
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     preprocessed_root = args.data_root / "preprocessed"
-    train_path, test_path = resolve_dataset_paths(preprocessed_root, split)
+    train_path, val_path, test_path = resolve_dataset_paths(preprocessed_root, split)
     ensure_file(train_path)
     ensure_file(test_path)
 
     train_df = load_subset_frame(train_path, args.target_channels)
+    val_df: pd.DataFrame | None = None
+    if val_path is not None:
+        ensure_file(val_path)
+        val_df = load_subset_frame(val_path, args.target_channels)
+        train_df = train_df[train_df.index < val_df.index.min()].copy()
+        if train_df.empty:
+            raise RuntimeError(f"Training split '{split}' becomes empty after removing the explicit validation tail.")
     test_df = load_subset_frame(test_path, args.target_channels)
 
-    raw_labels_path = args.data_root / "ESA-Mission1" / "labels.csv"
-    anomaly_types_path = args.data_root / "ESA-Mission1" / "anomaly_types.csv"
+    mission = infer_mission_from_split(split) or "ESA-Mission1"
+    raw_labels_path = args.data_root / mission / "labels.csv"
+    anomaly_types_path = args.data_root / mission / "anomaly_types.csv"
     ensure_file(raw_labels_path)
     ensure_file(anomaly_types_path)
 
@@ -725,7 +773,7 @@ def load_split_data(args: argparse.Namespace, split: str) -> tuple[pd.DataFrame,
         start_time=test_df.index.min(),
         end_time=test_df.index.max(),
     )
-    return train_df, test_df, train_labels, test_labels
+    return train_df, val_df, test_df, train_labels, test_labels
 
 
 def save_detector_results(
