@@ -205,7 +205,6 @@ class TcnTrainingConfig:
     reconstruction_loss_weight: float = 0.5
     forecast_score_weight: float = 1.0
     reconstruction_score_weight: float = 0.35
-    agreement_score_weight: float = 0.4
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
@@ -595,11 +594,9 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
-        agreement_scores = xp.sqrt(xp.maximum(forecast_scores, 0.0) * xp.maximum(recon_scores, 0.0))
         combined = (
             self.config.forecast_score_weight * forecast_scores
             + self.config.reconstruction_score_weight * recon_scores
-            + self.config.agreement_score_weight * agreement_scores
         )
         covered = (forecast_count > 0) | (recon_count > 0)
 
@@ -1586,6 +1583,40 @@ def rescue_strong_detector_suppressions(
     return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
+def cap_overused_prototype_suppressions(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    activation_matches: int,
+    max_matches_per_prototype: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    rescued = gated_predictions.copy()
+    kept_groups: list[pd.DataFrame] = []
+
+    for _, group in suppressed_events.groupby("prototype_id", sort=False):
+        if len(group) < activation_matches:
+            kept_groups.append(group)
+            continue
+
+        ranked = group.sort_values("score", ascending=False, kind="mergesort")
+        kept = ranked.iloc[:max_matches_per_prototype].copy()
+        rescued_rows = ranked.iloc[max_matches_per_prototype:]
+        for row in rescued_rows.itertuples(index=False):
+            start_time = pd.Timestamp(row.start_time)
+            end_time = pd.Timestamp(row.end_time)
+            rescued.loc[start_time:end_time, row.channel] = baseline_predictions.loc[start_time:end_time, row.channel].astype(
+                np.uint8
+            )
+        kept_groups.append(kept)
+
+    if not kept_groups:
+        return rescued, suppressed_events.iloc[0:0].copy()
+    return rescued, pd.concat(kept_groups, ignore_index=True)
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1735,6 +1766,13 @@ def run_tcn_split(
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
+    )
+    gated_predictions, suppressed_events = cap_overused_prototype_suppressions(
+        baseline_predictions=baseline_predictions,
+        gated_predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        activation_matches=180,
+        max_matches_per_prototype=160,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
