@@ -1583,6 +1583,69 @@ def rescue_strong_detector_suppressions(
     return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
+def rescue_cross_channel_supported_suppressions(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_peak_ratio: float,
+    min_duration_points: int,
+    min_supported_points: int,
+    min_support_fraction: float,
+    min_concurrent_support_channels: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    rescued = gated_predictions.copy()
+    thresholds = {
+        channel: max(float(global_thresholds[channel_index]), EPSILON)
+        for channel_index, channel in enumerate(target_channels)
+    }
+    kept_rows: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict(orient="records"):
+        channel = str(row["channel"])
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        if channel not in thresholds:
+            kept_rows.append(row)
+            continue
+
+        run_scores = scores.loc[start_time:end_time, channel]
+        if run_scores.empty or len(run_scores) < min_duration_points:
+            kept_rows.append(row)
+            continue
+
+        peak_ratio = float(run_scores.max()) / thresholds[channel]
+        if peak_ratio < min_peak_ratio:
+            kept_rows.append(row)
+            continue
+
+        support_window = baseline_predictions.loc[start_time:end_time, target_channels]
+        if support_window.empty:
+            kept_rows.append(row)
+            continue
+
+        other_support = support_window.drop(columns=[channel]).astype(np.uint8)
+        active_points = int((other_support.sum(axis=1) > 0).sum())
+        support_fraction = active_points / max(len(other_support), 1)
+        concurrent_support = int(other_support.sum(axis=1).max()) if len(other_support) else 0
+        if (
+            active_points >= min_supported_points
+            and support_fraction >= min_support_fraction
+            and concurrent_support >= min_concurrent_support_channels
+        ):
+            rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
+            continue
+
+        kept_rows.append(row)
+
+    return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1732,6 +1795,19 @@ def run_tcn_split(
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
+    )
+    gated_predictions, suppressed_events = rescue_cross_channel_supported_suppressions(
+        baseline_predictions=baseline_predictions,
+        gated_predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_peak_ratio=1.35,
+        min_duration_points=8,
+        min_supported_points=8,
+        min_support_fraction=0.5,
+        min_concurrent_support_channels=1,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
