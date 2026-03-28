@@ -1541,66 +1541,6 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
-def prune_threshold_hugging_isolated_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    max_run_points: int,
-    max_peak_ratio: float,
-    max_mean_ratio: float,
-    support_padding: int,
-) -> pd.DataFrame:
-    pruned = predictions.copy()
-    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        run_start: int | None = None
-
-        for index, value in enumerate(series):
-            if value == 1:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            run_length = run_stop - run_start
-            segment = channel_scores[run_start:run_stop]
-            peak_ratio = float(segment.max()) / threshold
-            mean_ratio = float(segment.mean()) / threshold
-            if run_length <= max_run_points and peak_ratio <= max_peak_ratio and mean_ratio <= max_mean_ratio:
-                support_start = max(0, run_start - support_padding)
-                support_stop = min(len(series), run_stop + support_padding)
-                support = prediction_values[support_start:support_stop].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    series[run_start:run_stop] = 0
-            run_start = None
-
-        if run_start is not None:
-            run_stop = len(series)
-            run_length = run_stop - run_start
-            segment = channel_scores[run_start:run_stop]
-            peak_ratio = float(segment.max()) / threshold
-            mean_ratio = float(segment.mean()) / threshold
-            if run_length <= max_run_points and peak_ratio <= max_peak_ratio and mean_ratio <= max_mean_ratio:
-                support_start = max(0, run_start - support_padding)
-                support = prediction_values[support_start:run_stop].copy()
-                support[:, channel_index] = 0
-                if not support.any():
-                    series[run_start:run_stop] = 0
-
-        pruned[channel] = series
-
-    return pruned
-
-
 def rescue_strong_detector_suppressions(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
@@ -1636,6 +1576,61 @@ def rescue_strong_detector_suppressions(
         peak_ratio = float(run_scores.max()) / thresholds[channel]
         if peak_ratio >= min_peak_ratio:
             rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
+            continue
+
+        kept_rows.append(row)
+
+    return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+
+
+def rescue_overused_prototype_suppressions(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_prototype_matches: int,
+    min_peak_ratio: float,
+    min_run_points: int,
+    max_match_score: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    rescued = gated_predictions.copy()
+    thresholds = {
+        channel: max(float(global_thresholds[channel_index]), EPSILON)
+        for channel_index, channel in enumerate(target_channels)
+    }
+    prototype_match_counts = suppressed_events["prototype_id"].astype(str).value_counts()
+    kept_rows: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict(orient="records"):
+        channel = str(row["channel"])
+        prototype_id = str(row["prototype_id"])
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        if channel not in thresholds:
+            kept_rows.append(row)
+            continue
+        if int(prototype_match_counts.get(prototype_id, 0)) < min_prototype_matches:
+            kept_rows.append(row)
+            continue
+        if float(row["score"]) > max_match_score:
+            kept_rows.append(row)
+            continue
+
+        run_scores = scores.loc[start_time:end_time, channel]
+        if len(run_scores) < min_run_points:
+            kept_rows.append(row)
+            continue
+
+        peak_ratio = float(run_scores.max()) / thresholds[channel]
+        if peak_ratio >= min_peak_ratio:
+            rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(
+                np.uint8
+            )
             continue
 
         kept_rows.append(row)
@@ -1758,16 +1753,6 @@ def run_tcn_split(
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
     )
-    baseline_predictions = prune_threshold_hugging_isolated_runs(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_run_points=18,
-        max_peak_ratio=1.2,
-        max_mean_ratio=1.05,
-        support_padding=10,
-    )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1802,6 +1787,18 @@ def run_tcn_split(
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
+    )
+    gated_predictions, suppressed_events = rescue_overused_prototype_suppressions(
+        baseline_predictions=baseline_predictions,
+        gated_predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_prototype_matches=40,
+        min_peak_ratio=2.5,
+        min_run_points=12,
+        max_match_score=0.99,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
