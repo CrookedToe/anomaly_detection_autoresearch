@@ -1583,7 +1583,7 @@ def rescue_strong_detector_suppressions(
     return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
-def apply_selective_same_channel_memory_gating(
+def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
     target_channels: list[str],
@@ -1591,56 +1591,20 @@ def apply_selective_same_channel_memory_gating(
     half_window: int,
     metric: str,
     threshold: float,
-    max_gate_run_points: int,
-    support_padding: int,
-    min_supporting_channels: int,
     vectorizer: Any | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
     suppressed_frames: list[pd.DataFrame] = []
-    prediction_values = predictions[target_channels].to_numpy(dtype=np.uint8, copy=True)
 
-    for channel_index, channel in enumerate(target_channels):
+    for channel in target_channels:
         channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
         if not channel_prototypes:
             continue
         channel_bank = RareNominalMemoryBank(channel_prototypes)
         channel_predictions = predictions.copy()
-        channel_candidate_series = prediction_values[:, channel_index].copy()
-        run_start: int | None = None
-
-        for index, value in enumerate(channel_candidate_series):
-            if value == 1:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-            run_stop = index
-            run_length = run_stop - run_start
-            support_start = max(0, run_start - support_padding)
-            support_stop = min(len(channel_candidate_series), run_stop + support_padding)
-            support = prediction_values[support_start:support_stop].copy()
-            support[:, channel_index] = 0
-            supporting_channels = int((support.max(axis=0) > 0).sum())
-            if run_length > max_gate_run_points and supporting_channels >= min_supporting_channels:
-                channel_candidate_series[run_start:run_stop] = 0
-            run_start = None
-
-        if run_start is not None:
-            run_stop = len(channel_candidate_series)
-            run_length = run_stop - run_start
-            support_start = max(0, run_start - support_padding)
-            support = prediction_values[support_start:run_stop].copy()
-            support[:, channel_index] = 0
-            supporting_channels = int((support.max(axis=0) > 0).sum())
-            if run_length > max_gate_run_points and supporting_channels >= min_supporting_channels:
-                channel_candidate_series[run_start:run_stop] = 0
-
         for other_channel in target_channels:
             if other_channel != channel:
                 channel_predictions[other_channel] = 0
-        channel_predictions[channel] = channel_candidate_series
         channel_gated, channel_suppressed = apply_memory_gating(
             frame=frame,
             predictions=channel_predictions,
@@ -1651,10 +1615,7 @@ def apply_selective_same_channel_memory_gating(
             threshold=threshold,
             vectorizer=vectorizer,
         )
-        eligible_mask = channel_candidate_series.astype(bool)
-        channel_output = predictions[channel].to_numpy(dtype=np.uint8, copy=True)
-        channel_output[eligible_mask] = channel_gated[channel].to_numpy(dtype=np.uint8, copy=False)[eligible_mask]
-        gated_predictions[channel] = channel_output
+        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
         if not channel_suppressed.empty:
             suppressed_frames.append(channel_suppressed)
 
@@ -1753,7 +1714,7 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_selective_same_channel_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
@@ -1761,9 +1722,6 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
-        max_gate_run_points=24,
-        support_padding=12,
-        min_supporting_channels=1,
         vectorizer=pipeline.vectorize_windows,
     )
     gated_predictions, suppressed_events = rescue_strong_detector_suppressions(
