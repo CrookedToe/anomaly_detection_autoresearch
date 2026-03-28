@@ -1541,6 +1541,48 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
+def rescue_strong_detector_suppressions(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_peak_ratio: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    rescued = gated_predictions.copy()
+    thresholds = {
+        channel: max(float(global_thresholds[channel_index]), EPSILON)
+        for channel_index, channel in enumerate(target_channels)
+    }
+    kept_rows: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict(orient="records"):
+        channel = str(row["channel"])
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        if channel not in thresholds:
+            kept_rows.append(row)
+            continue
+
+        run_scores = scores.loc[start_time:end_time, channel]
+        if run_scores.empty:
+            kept_rows.append(row)
+            continue
+
+        peak_ratio = float(run_scores.max()) / thresholds[channel]
+        if peak_ratio >= min_peak_ratio:
+            rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
+            continue
+
+        kept_rows.append(row)
+
+    return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1681,6 +1723,15 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+    )
+    gated_predictions, suppressed_events = rescue_strong_detector_suppressions(
+        baseline_predictions=baseline_predictions,
+        gated_predictions=gated_predictions,
+        suppressed_events=suppressed_events,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_peak_ratio=4.0,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
