@@ -49,7 +49,7 @@ class TcnModelConfig:
     embedding_dim: int = 64
     kernel_size: int = 3
     num_blocks: int = 5
-    dropout: float = 0.1
+    dropout: float = 0.05
     use_depthwise_separable: bool = True
 
 
@@ -193,9 +193,9 @@ class TcnTrainingConfig:
     embedding_dim: int = 64
     num_blocks: int = 5
     kernel_size: int = 3
-    dropout: float = 0.1
+    dropout: float = 0.05
     batch_size: int = 512
-    learning_rate: float = 1e-3
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-4
     epochs: int = 6
     mask_ratio: float = 0.15
@@ -210,7 +210,7 @@ class TcnTrainingConfig:
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
-    max_gap_fill: int = 1
+    max_gap_fill: int = 2
     validation_fraction: float = 0.1
     random_seed: int = 42
     device: str = "cuda"
@@ -331,22 +331,41 @@ class TcnAnomalyPipeline:
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
-    def fit(self, train_df: pd.DataFrame) -> dict[str, Any]:
+    def fit(self, train_df: pd.DataFrame, val_df: pd.DataFrame | None = None) -> dict[str, Any]:
         self._set_random_seed()
         self.scaler = self._fit_scaler(train_df)
 
-        base_features, raw_targets = self._transform_frame(train_df)
-        window_starts = self._build_window_starts(train_df, self.config.train_stride, training=True)
-        if len(window_starts) == 0:
+        train_base_features, train_raw_targets = self._transform_frame(train_df)
+        train_window_starts = self._build_window_starts(train_df, self.config.train_stride, training=True)
+        if len(train_window_starts) == 0:
             raise RuntimeError("No valid training windows were found for the TCN model.")
 
-        split_index = max(1, int(len(window_starts) * (1.0 - self.config.validation_fraction)))
-        train_starts = window_starts[:split_index]
-        val_starts = window_starts[split_index:] if split_index < len(window_starts) else window_starts[-1:]
+        validation_source = "tail_fraction"
+        train_starts = train_window_starts
+        val_base_features = train_base_features
+        val_raw_targets = train_raw_targets
+        calibration_frame = train_df
+        calibration_starts = train_window_starts
+
+        if val_df is None:
+            split_index = max(1, int(len(train_window_starts) * (1.0 - self.config.validation_fraction)))
+            train_starts = train_window_starts[:split_index]
+            val_starts = (
+                train_window_starts[split_index:] if split_index < len(train_window_starts) else train_window_starts[-1:]
+            )
+            calibration_starts = train_starts
+        else:
+            validation_source = "explicit_split"
+            val_base_features, val_raw_targets = self._transform_frame(val_df)
+            val_starts = self._build_window_starts(val_df, self.config.train_stride, training=True)
+            if len(val_starts) == 0:
+                raise RuntimeError("No valid validation windows were found for the explicit validation split.")
+            calibration_frame = val_df
+            calibration_starts = val_starts
 
         train_dataset = SelfSupervisedWindowDataset(
-            base_features=base_features,
-            raw_targets=raw_targets,
+            base_features=train_base_features,
+            raw_targets=train_raw_targets,
             window_starts=train_starts,
             sequence_length=self.config.sequence_length,
             horizon=self.config.horizon,
@@ -354,8 +373,8 @@ class TcnAnomalyPipeline:
             random_seed=self.config.random_seed,
         )
         val_dataset = SelfSupervisedWindowDataset(
-            base_features=base_features,
-            raw_targets=raw_targets,
+            base_features=val_base_features,
+            raw_targets=val_raw_targets,
             window_starts=val_starts,
             sequence_length=self.config.sequence_length,
             horizon=self.config.horizon,
@@ -365,7 +384,7 @@ class TcnAnomalyPipeline:
         preloaded_dataset = False
         dataset_bytes = train_dataset.total_bytes + val_dataset.total_bytes
 
-        input_dim = base_features.shape[1] + 1
+        input_dim = train_base_features.shape[1] + 1
         self.model = SelfSupervisedTcnForecaster(
             TcnModelConfig(
                 input_dim=input_dim,
@@ -446,7 +465,7 @@ class TcnAnomalyPipeline:
         if best_state is not None:
             self.model.load_state_dict(best_state)
 
-        self.global_thresholds = self._calibrate_thresholds(train_df, train_starts)
+        self.global_thresholds = self._calibrate_thresholds(calibration_frame, calibration_starts)
 
         return {
             "device": str(self.device),
@@ -459,6 +478,7 @@ class TcnAnomalyPipeline:
             "dataset_gb": float(dataset_bytes / (1024**3)),
             "num_train_windows": int(len(train_starts)),
             "num_val_windows": int(len(val_starts)),
+            "validation_source": validation_source,
             "history": history,
             "global_thresholds": self.global_thresholds.tolist(),
         }
@@ -819,10 +839,15 @@ class TcnAnomalyPipeline:
 
         for channel_index, channel in enumerate(self.target_channels):
             series = scores[channel].astype(np.float32)
-            smoothed_series = series.rolling(
+            rolling_mean = series.rolling(
                 self.config.score_smoothing_window,
                 min_periods=1,
             ).mean()
+            rolling_max = series.rolling(
+                self.config.score_smoothing_window,
+                min_periods=1,
+            ).max()
+            smoothed_series = (0.5 * (rolling_mean + rolling_max)).astype(np.float32)
             threshold_source = smoothed_series.shift(1)
             rolling_median = threshold_source.rolling(
                 self.config.threshold_window,
@@ -979,9 +1004,9 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_embedding_dim": 64,
     "tcn_num_blocks": 5,
     "tcn_kernel_size": 3,
-    "tcn_dropout": 0.1,
+    "tcn_dropout": 0.05,
     "tcn_batch_size": 2048,
-    "tcn_learning_rate": 1e-3,
+    "tcn_learning_rate": 5e-4,
     "tcn_weight_decay": 1e-4,
     "tcn_epochs": 4,
     "tcn_mask_ratio": 0.15,
@@ -992,7 +1017,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_min_anomaly_run_length": 5,
-    "tcn_max_gap_fill": 1,
+    "tcn_max_gap_fill": 2,
     "tcn_device": "cuda",
     "tcn_dataloader_workers": 8,
     "tcn_preload_dataset": True,
@@ -1026,9 +1051,17 @@ TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Mission 1 lightweight subset benchmark.")
+    parser = argparse.ArgumentParser(description="Run the ESA mission benchmark with paper-aligned split IDs.")
     parser.add_argument("--detectors", nargs="+", choices=["std", "tcn"], default=DEFAULT_AUTORESEARCH_DETECTORS)
-    parser.add_argument("--splits", nargs="+", default=DEFAULT_AUTORESEARCH_SPLITS)
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=DEFAULT_AUTORESEARCH_SPLITS,
+        help=(
+            "Logical split IDs. Use `10_months` for the quick-training split, "
+            "`84_months` for the full Mission1 paper split, or `21_months` for the full Mission2 paper split."
+        ),
+    )
     parser.add_argument("--target-channels", nargs="+", default=DEFAULT_TARGET_CHANNELS)
     parser.add_argument("--tol", type=float, default=5.0, help="STD threshold multiplier.")
     parser.add_argument("--half-window", type=int, default=64, help="Half-window size for memory matching.")
@@ -1167,10 +1200,395 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
     )
 
 
+def prune_short_isolated_runs(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    min_run_points: int,
+    support_padding: int,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = values[:, channel_index].copy()
+        run_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 1 and run_start is None:
+                run_start = index
+                continue
+            if value == 1:
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            run_length = run_stop - run_start
+            if run_length < min_run_points:
+                support_start = max(0, run_start - support_padding)
+                support_stop = min(len(series), run_stop + support_padding)
+                support = values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
+                    series[run_start:run_stop] = 0
+            run_start = None
+        if run_start is not None:
+            run_stop = len(series)
+            run_length = run_stop - run_start
+            if run_length < min_run_points:
+                support_start = max(0, run_start - support_padding)
+                support = values[support_start:run_stop].copy()
+                support[:, channel_index] = 0
+                if not support.any():
+                    series[run_start:run_stop] = 0
+        pruned[channel] = series
+
+    return pruned
+
+
+def merge_supported_close_runs(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    max_gap_points: int,
+    support_padding: int,
+) -> pd.DataFrame:
+    merged = predictions.copy()
+    values = merged[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = values[:, channel_index].copy()
+        zero_start: int | None = None
+        for index, value in enumerate(series):
+            if value == 0:
+                if zero_start is None:
+                    zero_start = index
+                continue
+            if zero_start is None:
+                continue
+            gap_length = index - zero_start
+            if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
+                support_start = max(0, zero_start - support_padding)
+                support_stop = min(len(series), index + support_padding)
+                support = values[support_start:support_stop].copy()
+                support[:, channel_index] = 0
+                if support.any():
+                    series[zero_start:index] = 1
+            zero_start = None
+        merged[channel] = series
+
+    return merged
+
+
+def prune_weak_isolated_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    max_run_points: int,
+    support_padding: int,
+    peak_quantile: float,
+    density_quantile: float,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        runs: list[tuple[int, int, int, float, float]] = []
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            segment = channel_scores[run_start:run_stop]
+            run_length = run_stop - run_start
+            runs.append((run_start, run_stop, run_length, float(segment.max()), float(segment.mean())))
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            segment = channel_scores[run_start:run_stop]
+            run_length = run_stop - run_start
+            runs.append((run_start, run_stop, run_length, float(segment.max()), float(segment.mean())))
+
+        if not runs:
+            continue
+
+        peak_cutoff = float(np.quantile([run[3] for run in runs], peak_quantile))
+        density_cutoff = float(np.quantile([run[4] for run in runs], density_quantile))
+
+        for run_start, run_stop, run_length, peak_score, mean_score in runs:
+            if run_length > max_run_points:
+                continue
+            if peak_score > peak_cutoff or mean_score > density_cutoff:
+                continue
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = prediction_values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            if support.any():
+                continue
+            series[run_start:run_stop] = 0
+
+        pruned[channel] = series
+
+    return pruned
+
+
+def extend_high_confidence_run_edges(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_run_peak_ratio: float,
+    extension_score_ratio: float,
+    max_extension_points: int,
+) -> pd.DataFrame:
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            run_peak = float(channel_scores[run_start:run_stop].max())
+            if run_peak < (threshold * min_run_peak_ratio):
+                continue
+
+            extension_floor = threshold * extension_score_ratio
+
+            left = run_start
+            while left > 0 and (run_start - left) < max_extension_points:
+                if series[left - 1] == 1 or channel_scores[left - 1] < extension_floor:
+                    break
+                left -= 1
+
+            right = run_stop
+            while right < len(series) and (right - run_stop) < max_extension_points:
+                if series[right] == 1 or channel_scores[right] < extension_floor:
+                    break
+                right += 1
+
+            series[left:right] = 1
+            index = max(index, right)
+
+        extended[channel] = series
+
+    return extended
+
+
+def expand_prediction_run_boundaries(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    pre_points: int,
+    post_points: int,
+) -> pd.DataFrame:
+    expanded = predictions.copy()
+    prediction_values = expanded[target_channels].to_numpy(dtype=np.uint8, copy=True)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            expand_start = max(0, run_start - max(0, pre_points))
+            expand_stop = min(len(series), run_stop + max(0, post_points))
+            series[expand_start:expand_stop] = 1
+
+        expanded[channel] = series
+
+    return expanded
+
+
+def extend_high_confidence_run_tails(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_run_peak_ratio: float,
+    extension_score_ratio: float,
+    max_extension_points: int,
+) -> pd.DataFrame:
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            run_peak = float(channel_scores[run_start:run_stop].max())
+            if run_peak < (threshold * min_run_peak_ratio):
+                continue
+
+            extension_floor = threshold * extension_score_ratio
+            right = run_stop
+            while right < len(series) and (right - run_stop) < max_extension_points:
+                if series[right] == 1 or channel_scores[right] < extension_floor:
+                    break
+                right += 1
+
+            series[run_start:right] = 1
+            index = max(index, right)
+
+        prediction_values[:, channel_index] = series
+
+    extended[target_channels] = prediction_values
+    return extended
+
+
+def prune_noisy_channel_short_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    support_padding: int,
+    noisy_run_median_threshold: float,
+    noisy_peak_ratio_median_threshold: float,
+    min_run_points: int,
+    max_short_run_peak_ratio: float,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        runs: list[tuple[int, int, int, float]] = []
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
+
+        if not runs:
+            continue
+
+        median_run_length = float(np.median([run[2] for run in runs]))
+        median_peak_ratio = float(np.median([run[3] for run in runs]))
+        if median_run_length > noisy_run_median_threshold or median_peak_ratio > noisy_peak_ratio_median_threshold:
+            continue
+
+        for run_start, run_stop, run_length, peak_ratio in runs:
+            if run_length >= min_run_points or peak_ratio > max_short_run_peak_ratio:
+                continue
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = prediction_values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            if support.any():
+                continue
+            series[run_start:run_stop] = 0
+
+        pruned[channel] = series
+
+    return pruned
+
+
+def apply_same_channel_memory_gating(
+    frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    memory_bank: RareNominalMemoryBank,
+    half_window: int,
+    metric: str,
+    threshold: float,
+    vectorizer: Any | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    gated_predictions = predictions.copy()
+    suppressed_frames: list[pd.DataFrame] = []
+
+    for channel in target_channels:
+        channel_prototypes = [prototype for prototype in memory_bank.prototypes if prototype.channel == channel]
+        if not channel_prototypes:
+            continue
+        channel_bank = RareNominalMemoryBank(channel_prototypes)
+        channel_predictions = predictions.copy()
+        for other_channel in target_channels:
+            if other_channel != channel:
+                channel_predictions[other_channel] = 0
+        channel_gated, channel_suppressed = apply_memory_gating(
+            frame=frame,
+            predictions=channel_predictions,
+            target_channels=target_channels,
+            memory_bank=channel_bank,
+            half_window=half_window,
+            metric=metric,
+            threshold=threshold,
+            vectorizer=vectorizer,
+        )
+        gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
+        if not channel_suppressed.empty:
+            suppressed_frames.append(channel_suppressed)
+
+    if suppressed_frames:
+        suppressed_events = pd.concat(suppressed_frames, ignore_index=True)
+    else:
+        suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
+    return gated_predictions, suppressed_events
+
+
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
     train_df: pd.DataFrame,
+    val_df: pd.DataFrame | None,
     test_df: pd.DataFrame,
     train_labels: pd.DataFrame,
     test_labels: pd.DataFrame,
@@ -1178,11 +1596,66 @@ def run_tcn_split(
     resolved_args = resolve_split_parameters(args, split)
     tcn_config = build_tcn_config(args, split)
     pipeline = TcnAnomalyPipeline(target_channels=args.target_channels, config=tcn_config)
-    training_summary = pipeline.fit(train_df)
+    training_summary = pipeline.fit(train_df, val_df=val_df)
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
-
+    baseline_predictions = prune_short_isolated_runs(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        min_run_points=20,
+        support_padding=8,
+    )
+    baseline_predictions = merge_supported_close_runs(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        max_gap_points=8,
+        support_padding=8,
+    )
+    baseline_predictions = prune_weak_isolated_runs(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        max_run_points=12,
+        support_padding=8,
+        peak_quantile=0.35,
+        density_quantile=0.35,
+    )
+    baseline_predictions = extend_high_confidence_run_edges(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_run_peak_ratio=1.15,
+        extension_score_ratio=0.8,
+        max_extension_points=6,
+    )
+    baseline_predictions = expand_prediction_run_boundaries(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        pre_points=1,
+        post_points=0,
+    )
+    baseline_predictions = extend_high_confidence_run_tails(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_run_peak_ratio=1.2,
+        extension_score_ratio=0.9,
+        max_extension_points=1,
+    )
+    baseline_predictions = prune_noisy_channel_short_runs(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        support_padding=8,
+        noisy_run_median_threshold=8.0,
+        noisy_peak_ratio_median_threshold=1.2,
+        min_run_points=6,
+        max_short_run_peak_ratio=1.35,
+    )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
     log_debug(f"[tcn] saving model for '{split}'")
@@ -1199,7 +1672,7 @@ def run_tcn_split(
         vectorizer=pipeline.vectorize_windows,
     )
     log_debug(f"[tcn] applying memory gating for '{split}'")
-    gated_predictions, suppressed_events = apply_memory_gating(
+    gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
         predictions=baseline_predictions,
         target_channels=args.target_channels,
@@ -1250,12 +1723,12 @@ def run_tcn_split(
 
 
 def run_split(args: argparse.Namespace, split: str) -> list[dict[str, Any]]:
-    train_df, test_df, train_labels, test_labels = load_split_data(args, split)
+    train_df, val_df, test_df, train_labels, test_labels = load_split_data(args, split)
     rows: list[dict[str, Any]] = []
     if "std" in args.detectors:
         rows.append(run_std_split(args, split, train_df, test_df, train_labels, test_labels))
     if "tcn" in args.detectors:
-        rows.append(run_tcn_split(args, split, train_df, test_df, train_labels, test_labels))
+        rows.append(run_tcn_split(args, split, train_df, val_df, test_df, train_labels, test_labels))
     return rows
 
 

@@ -1,4 +1,4 @@
-# ESA Mission 1 Subset Project
+# ESA Mission Split Project
 
 This repo is centered around a few entrypoints plus optional search:
 
@@ -13,7 +13,7 @@ The dataset folders under `data/` were kept intact. The large benchmark framewor
 
 ## Main Files
 
-- `ingest.py`: builds the six-channel Mission 1 subset CSVs
+- `ingest.py`: builds the mission-aligned train/validation/test CSVs with unambiguous split names
 - `train.py`: default autoresearch entrypoint; writes `summary.csv`, `reading_materials_snapshot.json`, `run_summary.json`, and append-only `experiment_log.jsonl`
 - `eval.py`: generates human-readable and machine-readable summaries from `summary.csv`
 - `optuna_search.py`: runs Optuna/TPE search over the strongest TCN and memory hyperparameters
@@ -53,13 +53,14 @@ Generate the project subset:
 .venv/bin/python ingest.py
 ```
 
-This writes:
+This writes mission-aligned paper splits with unambiguous names. For example:
 
 ```text
-data/preprocessed/multivariate/ESA-Mission1-subset-semi-supervised/
-├── 3_months.train.csv
-├── 10_months.train.csv
-└── 84_months.test.csv
+data/preprocessed/multivariate/ESA-Mission1-semi-supervised/
+├── 81_months.train.csv
+├── 3_months.val.csv
+├── 84_months.test.csv
+└── 10_months.train.csv
 ```
 
 ## Run Benchmark
@@ -70,7 +71,7 @@ Run the reduced benchmark:
 .venv/bin/python train.py
 ```
 
-The default autoresearch run is the TCN on `10_months` with a fixed `900` second TCN training budget. Override the CLI only when you intentionally want a different experiment contract.
+The default autoresearch run is the TCN on the `10_months` quick-training split with a fixed `900` second TCN training budget. Override the CLI only when you intentionally want a different experiment contract.
 
 To rerun the proven `10_months` TCN finalist config from the search results:
 
@@ -78,11 +79,11 @@ To rerun the proven `10_months` TCN finalist config from the search results:
 .venv/bin/python train.py --detectors tcn --splits 10_months --tcn-preset best_10m
 ```
 
-The random search now scores configurations on both `3_months` and `10_months` by default, instead of promoting `3_months` winners first.
+The quick-training split remains `10_months`. The full paper splits are addressed via the logical split IDs `84_months` for Mission1 and `21_months` for Mission2, which resolve to the unambiguous on-disk files `81_months.train.csv` / `3_months.val.csv` / `84_months.test.csv` and `18_months.train.csv` / `3_months.val.csv` / `21_months.test.csv`.
 
 ## Run Optuna Search
 
-To run Bayesian optimization with Optuna on the `10_months` split:
+To run Bayesian optimization with Optuna on the `10_months` quick-training split:
 
 ```bash
 .venv/bin/python optuna_search.py --splits 10_months --num-trials 50
