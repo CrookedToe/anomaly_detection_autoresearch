@@ -1549,6 +1549,7 @@ def rescue_strong_detector_suppressions(
     target_channels: list[str],
     global_thresholds: np.ndarray,
     min_peak_ratio: float,
+    min_run_points: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if suppressed_events.empty:
         return gated_predictions, suppressed_events
@@ -1574,7 +1575,7 @@ def rescue_strong_detector_suppressions(
             continue
 
         peak_ratio = float(run_scores.max()) / thresholds[channel]
-        if peak_ratio >= min_peak_ratio:
+        if peak_ratio >= min_peak_ratio and len(run_scores) >= min_run_points:
             rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
             continue
 
@@ -1731,7 +1732,8 @@ def run_tcn_split(
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_peak_ratio=4.0,
+        min_peak_ratio=3.0,
+        min_run_points=12,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
