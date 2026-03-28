@@ -1541,6 +1541,70 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
+def suppress_noisy_retrigger_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_channel_runs: int,
+    max_gap_points: int,
+    max_run_points: int,
+    max_peak_ratio: float,
+    support_padding: int,
+) -> pd.DataFrame:
+    suppressed = predictions.copy()
+    prediction_values = suppressed[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        runs: list[tuple[int, int, int, float]] = []
+        run_start: int | None = None
+
+        for index, value in enumerate(series):
+            if value == 1:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is None:
+                continue
+            run_stop = index
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            segment = channel_scores[run_start:run_stop]
+            runs.append((run_start, run_stop, run_stop - run_start, float(segment.max()) / threshold))
+
+        if len(runs) < min_channel_runs:
+            continue
+
+        for run_index in range(1, len(runs)):
+            run_start, run_stop, run_length, peak_ratio = runs[run_index]
+            previous_stop = runs[run_index - 1][1]
+            gap_points = run_start - previous_stop
+            if gap_points > max_gap_points or run_length > max_run_points or peak_ratio > max_peak_ratio:
+                continue
+
+            support_start = max(0, run_start - support_padding)
+            support_stop = min(len(series), run_stop + support_padding)
+            support = prediction_values[support_start:support_stop].copy()
+            support[:, channel_index] = 0
+            if support.any():
+                continue
+
+            series[run_start:run_stop] = 0
+
+        suppressed[channel] = series
+
+    return suppressed
+
+
 def rescue_strong_detector_suppressions(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
@@ -1697,6 +1761,17 @@ def run_tcn_split(
         noisy_peak_ratio_median_threshold=1.2,
         min_run_points=6,
         max_short_run_peak_ratio=1.35,
+    )
+    baseline_predictions = suppress_noisy_retrigger_runs(
+        predictions=baseline_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        min_channel_runs=120,
+        max_gap_points=48,
+        max_run_points=12,
+        max_peak_ratio=1.4,
+        support_padding=8,
     )
     baseline_dir = args.results_root / "tcn_baseline" / split
     baseline_dir.mkdir(parents=True, exist_ok=True)
