@@ -331,22 +331,41 @@ class TcnAnomalyPipeline:
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
-    def fit(self, train_df: pd.DataFrame) -> dict[str, Any]:
+    def fit(self, train_df: pd.DataFrame, val_df: pd.DataFrame | None = None) -> dict[str, Any]:
         self._set_random_seed()
         self.scaler = self._fit_scaler(train_df)
 
-        base_features, raw_targets = self._transform_frame(train_df)
-        window_starts = self._build_window_starts(train_df, self.config.train_stride, training=True)
-        if len(window_starts) == 0:
+        train_base_features, train_raw_targets = self._transform_frame(train_df)
+        train_window_starts = self._build_window_starts(train_df, self.config.train_stride, training=True)
+        if len(train_window_starts) == 0:
             raise RuntimeError("No valid training windows were found for the TCN model.")
 
-        split_index = max(1, int(len(window_starts) * (1.0 - self.config.validation_fraction)))
-        train_starts = window_starts[:split_index]
-        val_starts = window_starts[split_index:] if split_index < len(window_starts) else window_starts[-1:]
+        validation_source = "tail_fraction"
+        train_starts = train_window_starts
+        val_base_features = train_base_features
+        val_raw_targets = train_raw_targets
+        calibration_frame = train_df
+        calibration_starts = train_window_starts
+
+        if val_df is None:
+            split_index = max(1, int(len(train_window_starts) * (1.0 - self.config.validation_fraction)))
+            train_starts = train_window_starts[:split_index]
+            val_starts = (
+                train_window_starts[split_index:] if split_index < len(train_window_starts) else train_window_starts[-1:]
+            )
+            calibration_starts = train_starts
+        else:
+            validation_source = "explicit_split"
+            val_base_features, val_raw_targets = self._transform_frame(val_df)
+            val_starts = self._build_window_starts(val_df, self.config.train_stride, training=True)
+            if len(val_starts) == 0:
+                raise RuntimeError("No valid validation windows were found for the explicit validation split.")
+            calibration_frame = val_df
+            calibration_starts = val_starts
 
         train_dataset = SelfSupervisedWindowDataset(
-            base_features=base_features,
-            raw_targets=raw_targets,
+            base_features=train_base_features,
+            raw_targets=train_raw_targets,
             window_starts=train_starts,
             sequence_length=self.config.sequence_length,
             horizon=self.config.horizon,
@@ -354,8 +373,8 @@ class TcnAnomalyPipeline:
             random_seed=self.config.random_seed,
         )
         val_dataset = SelfSupervisedWindowDataset(
-            base_features=base_features,
-            raw_targets=raw_targets,
+            base_features=val_base_features,
+            raw_targets=val_raw_targets,
             window_starts=val_starts,
             sequence_length=self.config.sequence_length,
             horizon=self.config.horizon,
@@ -365,7 +384,7 @@ class TcnAnomalyPipeline:
         preloaded_dataset = False
         dataset_bytes = train_dataset.total_bytes + val_dataset.total_bytes
 
-        input_dim = base_features.shape[1] + 1
+        input_dim = train_base_features.shape[1] + 1
         self.model = SelfSupervisedTcnForecaster(
             TcnModelConfig(
                 input_dim=input_dim,
@@ -446,7 +465,7 @@ class TcnAnomalyPipeline:
         if best_state is not None:
             self.model.load_state_dict(best_state)
 
-        self.global_thresholds = self._calibrate_thresholds(train_df, train_starts)
+        self.global_thresholds = self._calibrate_thresholds(calibration_frame, calibration_starts)
 
         return {
             "device": str(self.device),
@@ -459,6 +478,7 @@ class TcnAnomalyPipeline:
             "dataset_gb": float(dataset_bytes / (1024**3)),
             "num_train_windows": int(len(train_starts)),
             "num_val_windows": int(len(val_starts)),
+            "validation_source": validation_source,
             "history": history,
             "global_thresholds": self.global_thresholds.tolist(),
         }
@@ -1031,9 +1051,17 @@ TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Mission 1 lightweight subset benchmark.")
+    parser = argparse.ArgumentParser(description="Run the ESA mission benchmark with paper-aligned split IDs.")
     parser.add_argument("--detectors", nargs="+", choices=["std", "tcn"], default=DEFAULT_AUTORESEARCH_DETECTORS)
-    parser.add_argument("--splits", nargs="+", default=DEFAULT_AUTORESEARCH_SPLITS)
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=DEFAULT_AUTORESEARCH_SPLITS,
+        help=(
+            "Logical split IDs. Use `10_months` for the quick-training split, "
+            "`84_months` for the full Mission1 paper split, or `21_months` for the full Mission2 paper split."
+        ),
+    )
     parser.add_argument("--target-channels", nargs="+", default=DEFAULT_TARGET_CHANNELS)
     parser.add_argument("--tol", type=float, default=5.0, help="STD threshold multiplier.")
     parser.add_argument("--half-window", type=int, default=64, help="Half-window size for memory matching.")
@@ -1560,6 +1588,7 @@ def run_tcn_split(
     args: argparse.Namespace,
     split: str,
     train_df: pd.DataFrame,
+    val_df: pd.DataFrame | None,
     test_df: pd.DataFrame,
     train_labels: pd.DataFrame,
     test_labels: pd.DataFrame,
@@ -1567,7 +1596,7 @@ def run_tcn_split(
     resolved_args = resolve_split_parameters(args, split)
     tcn_config = build_tcn_config(args, split)
     pipeline = TcnAnomalyPipeline(target_channels=args.target_channels, config=tcn_config)
-    training_summary = pipeline.fit(train_df)
+    training_summary = pipeline.fit(train_df, val_df=val_df)
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
@@ -1694,12 +1723,12 @@ def run_tcn_split(
 
 
 def run_split(args: argparse.Namespace, split: str) -> list[dict[str, Any]]:
-    train_df, test_df, train_labels, test_labels = load_split_data(args, split)
+    train_df, val_df, test_df, train_labels, test_labels = load_split_data(args, split)
     rows: list[dict[str, Any]] = []
     if "std" in args.detectors:
         rows.append(run_std_split(args, split, train_df, test_df, train_labels, test_labels))
     if "tcn" in args.detectors:
-        rows.append(run_tcn_split(args, split, train_df, test_df, train_labels, test_labels))
+        rows.append(run_tcn_split(args, split, train_df, val_df, test_df, train_labels, test_labels))
     return rows
 
 
