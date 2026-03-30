@@ -1414,6 +1414,71 @@ def merge_supported_close_runs(
     return merged
 
 
+def bridge_score_supported_gaps(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_gap_points: int,
+    min_gap_mean_ratio: float,
+    min_endpoint_peak_ratio: float,
+) -> pd.DataFrame:
+    bridged = predictions.copy()
+    prediction_values = bridged[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            left_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            left_stop = index
+
+            gap_start = index
+            while index < len(series) and series[index] == 0:
+                index += 1
+            gap_stop = index
+
+            if gap_start == gap_stop or gap_stop >= len(series) or series[gap_stop] != 1:
+                continue
+
+            right_start = gap_stop
+            while index < len(series) and series[index] == 1:
+                index += 1
+            right_stop = index
+
+            gap_length = gap_stop - gap_start
+            if gap_length > max_gap_points:
+                continue
+
+            left_peak_ratio = float(channel_scores[left_start:left_stop].max()) / threshold
+            right_peak_ratio = float(channel_scores[right_start:right_stop].max()) / threshold
+            if max(left_peak_ratio, right_peak_ratio) < min_endpoint_peak_ratio:
+                continue
+
+            gap_scores = channel_scores[gap_start:gap_stop]
+            gap_mean_ratio = float(gap_scores.mean()) / threshold
+            if gap_mean_ratio < min_gap_mean_ratio:
+                continue
+
+            series[gap_start:gap_stop] = 1
+
+        prediction_values[:, channel_index] = series
+
+    bridged[target_channels] = prediction_values
+    return bridged
+
+
 def prune_weak_isolated_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1924,6 +1989,16 @@ def run_tcn_split(
         max_gap_points=8,
         support_padding=8,
     )
+    if split in MISSION1_SMALL_DATA_SPLITS and int(split.split("_", maxsplit=1)[0]) <= 4:
+        baseline_predictions = bridge_score_supported_gaps(
+            predictions=baseline_predictions,
+            scores=baseline_scores,
+            target_channels=args.target_channels,
+            global_thresholds=pipeline.global_thresholds,
+            max_gap_points=12,
+            min_gap_mean_ratio=0.6,
+            min_endpoint_peak_ratio=1.15,
+        )
     baseline_predictions = prune_weak_isolated_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
