@@ -1773,30 +1773,6 @@ def apply_same_channel_memory_gating(
     return gated_predictions, suppressed_events
 
 
-def deduplicate_memory_bank_by_event_channel(memory_bank: RareNominalMemoryBank) -> RareNominalMemoryBank:
-    if not memory_bank.prototypes:
-        return memory_bank
-
-    selected: dict[tuple[str, str], Any] = {}
-    durations: dict[tuple[str, str], float] = {}
-
-    for prototype in memory_bank.prototypes:
-        key = (prototype.event_id, prototype.channel)
-        start_time = pd.Timestamp(prototype.start_time)
-        end_time = pd.Timestamp(prototype.end_time)
-        duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
-        current_duration = durations.get(key)
-        if current_duration is None or duration_seconds > current_duration:
-            selected[key] = prototype
-            durations[key] = duration_seconds
-
-    ordered = sorted(
-        selected.values(),
-        key=lambda prototype: (pd.Timestamp(prototype.start_time), prototype.channel, prototype.event_id),
-    )
-    return RareNominalMemoryBank(ordered)
-
-
 def run_tcn_split(
     args: argparse.Namespace,
     split: str,
@@ -1884,7 +1860,6 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
-    memory_bank = deduplicate_memory_bank_by_event_channel(memory_bank)
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
@@ -1909,8 +1884,8 @@ def run_tcn_split(
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
         suppressed_events=suppressed_events,
-        activation_matches=180,
-        max_matches_per_prototype=160,
+        activation_matches=25,
+        max_matches_per_prototype=24,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
