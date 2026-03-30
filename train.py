@@ -323,6 +323,8 @@ class TcnAnomalyPipeline:
         self.scaler: FeatureScaler | None = None
         self.model: SelfSupervisedTcnForecaster | None = None
         self.global_thresholds: np.ndarray | None = None
+        self.forecast_scales: np.ndarray | None = None
+        self.reconstruction_scales: np.ndarray | None = None
         self.use_amp = self.device.type == "cuda" and config.mixed_precision
         self.cp = self._try_load_cupy()
 
@@ -465,7 +467,10 @@ class TcnAnomalyPipeline:
         if best_state is not None:
             self.model.load_state_dict(best_state)
 
-        self.global_thresholds = self._calibrate_thresholds(calibration_frame, calibration_starts)
+        self.forecast_scales, self.reconstruction_scales, self.global_thresholds = self._calibrate_score_components(
+            calibration_frame,
+            calibration_starts,
+        )
 
         return {
             "device": str(self.device),
@@ -480,6 +485,8 @@ class TcnAnomalyPipeline:
             "num_val_windows": int(len(val_starts)),
             "validation_source": validation_source,
             "history": history,
+            "forecast_scales": None if self.forecast_scales is None else self.forecast_scales.tolist(),
+            "reconstruction_scales": None if self.reconstruction_scales is None else self.reconstruction_scales.tolist(),
             "global_thresholds": self.global_thresholds.tolist(),
         }
 
@@ -494,6 +501,26 @@ class TcnAnomalyPipeline:
         stride: int | None = None,
         window_starts: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        forecast_scores, recon_scores, forecast_covered, recon_covered = self._aggregate_component_scores(
+            frame=frame,
+            stride=stride,
+            window_starts=window_starts,
+        )
+        combined = self._combine_component_scores(
+            forecast_scores=forecast_scores,
+            reconstruction_scores=recon_scores,
+            forecast_scales=self.forecast_scales,
+            reconstruction_scales=self.reconstruction_scales,
+        )
+        covered = forecast_covered | recon_covered
+        return combined.astype(np.float32), covered.astype(bool)
+
+    def _aggregate_component_scores(
+        self,
+        frame: pd.DataFrame,
+        stride: int | None = None,
+        window_starts: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if self.model is None or self.scaler is None:
             raise RuntimeError("The TCN pipeline must be fitted before scoring.")
 
@@ -594,16 +621,41 @@ class TcnAnomalyPipeline:
                 out=np.zeros_like(recon_sum),
                 where=recon_count > 0,
             )
-        combined = (
-            self.config.forecast_score_weight * forecast_scores
-            + self.config.reconstruction_score_weight * recon_scores
-        )
-        covered = (forecast_count > 0) | (recon_count > 0)
-
         if self.cp is not None:
-            combined = self.cp.asnumpy(combined)
-            covered = self.cp.asnumpy(covered)
-        return combined.astype(np.float32), covered.astype(bool)
+            forecast_scores = self.cp.asnumpy(forecast_scores)
+            recon_scores = self.cp.asnumpy(recon_scores)
+            forecast_count = self.cp.asnumpy(forecast_count)
+            recon_count = self.cp.asnumpy(recon_count)
+        forecast_covered = forecast_count > 0
+        recon_covered = recon_count > 0
+        return (
+            forecast_scores.astype(np.float32),
+            recon_scores.astype(np.float32),
+            forecast_covered.astype(bool),
+            recon_covered.astype(bool),
+        )
+
+    def _combine_component_scores(
+        self,
+        forecast_scores: np.ndarray,
+        reconstruction_scores: np.ndarray,
+        forecast_scales: np.ndarray | None,
+        reconstruction_scales: np.ndarray | None,
+    ) -> np.ndarray:
+        if forecast_scales is None:
+            forecast_scale = np.ones((1, forecast_scores.shape[1]), dtype=np.float32)
+        else:
+            forecast_scale = np.maximum(np.asarray(forecast_scales, dtype=np.float32).reshape(1, -1), EPSILON)
+        if reconstruction_scales is None:
+            reconstruction_scale = np.ones((1, reconstruction_scores.shape[1]), dtype=np.float32)
+        else:
+            reconstruction_scale = np.maximum(np.asarray(reconstruction_scales, dtype=np.float32).reshape(1, -1), EPSILON)
+
+        forecast_normalized = forecast_scores / forecast_scale
+        reconstruction_normalized = reconstruction_scores / reconstruction_scale
+        dominant_component = np.maximum(forecast_normalized, reconstruction_normalized)
+        supporting_component = np.minimum(forecast_normalized, reconstruction_normalized)
+        return dominant_component + (0.25 * supporting_component)
 
     def predict(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         scores = self.score_sequence(frame)
@@ -676,6 +728,8 @@ class TcnAnomalyPipeline:
                 "nominal_dt_seconds": self.scaler.nominal_dt_seconds,
             },
             "global_thresholds": None if self.global_thresholds is None else self.global_thresholds.tolist(),
+            "forecast_scales": None if self.forecast_scales is None else self.forecast_scales.tolist(),
+            "reconstruction_scales": None if self.reconstruction_scales is None else self.reconstruction_scales.tolist(),
             "metadata": metadata,
         }
         torch.save(payload, path)
@@ -898,20 +952,43 @@ class TcnAnomalyPipeline:
 
         return processed
 
-    def _calibrate_thresholds(self, train_df: pd.DataFrame, train_starts: np.ndarray) -> np.ndarray:
-        combined, covered = self._aggregate_scores(
+    def _calibrate_score_components(self, train_df: pd.DataFrame, train_starts: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        forecast_scores, reconstruction_scores, forecast_covered, reconstruction_covered = self._aggregate_component_scores(
             frame=train_df,
             stride=self.config.train_stride,
             window_starts=train_starts,
         )
+        combined_covered = forecast_covered | reconstruction_covered
+        forecast_scales = np.ones(len(self.target_channels), dtype=np.float32)
+        reconstruction_scales = np.ones(len(self.target_channels), dtype=np.float32)
         thresholds = np.zeros(len(self.target_channels), dtype=np.float32)
         for channel_index in range(len(self.target_channels)):
-            valid_scores = combined[covered[:, channel_index], channel_index]
+            valid_forecast_scores = forecast_scores[forecast_covered[:, channel_index], channel_index]
+            if len(valid_forecast_scores) > 0:
+                forecast_scales[channel_index] = float(
+                    max(np.quantile(valid_forecast_scores, self.config.calibration_quantile), EPSILON)
+                )
+            valid_reconstruction_scores = reconstruction_scores[
+                reconstruction_covered[:, channel_index],
+                channel_index,
+            ]
+            if len(valid_reconstruction_scores) > 0:
+                reconstruction_scales[channel_index] = float(
+                    max(np.quantile(valid_reconstruction_scores, self.config.calibration_quantile), EPSILON)
+                )
+        combined = self._combine_component_scores(
+            forecast_scores=forecast_scores,
+            reconstruction_scores=reconstruction_scores,
+            forecast_scales=forecast_scales,
+            reconstruction_scales=reconstruction_scales,
+        )
+        for channel_index in range(len(self.target_channels)):
+            valid_scores = combined[combined_covered[:, channel_index], channel_index]
             if len(valid_scores) == 0:
                 thresholds[channel_index] = 0.0
                 continue
             thresholds[channel_index] = float(np.quantile(valid_scores, self.config.calibration_quantile))
-        return thresholds
+        return forecast_scales, reconstruction_scales, thresholds
 
     def _pad_or_trim_window(self, window: pd.DataFrame) -> pd.DataFrame:
         target_window = window.copy()
