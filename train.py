@@ -242,6 +242,7 @@ class TcnTrainingConfig:
     forecast_score_weight: float = 1.0
     reconstruction_score_weight: float = 0.35
     component_mismatch_score_weight: float = 0.0
+    reconstruction_tail_points: int = 1
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
@@ -597,9 +598,12 @@ class TcnAnomalyPipeline:
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
                     forecast, reconstruction, _ = self.model(model_inputs.to(self.device, non_blocking=True))
                     forecast_error_t = torch.abs(forecast - batch_targets.to(self.device, non_blocking=True)).float()
+                    tail_points = max(1, min(self.config.reconstruction_tail_points, reconstruction.shape[1]))
                     reconstruction_error_t = torch.abs(
-                        reconstruction[:, -1, :] - batch_histories[:, -1, :].to(self.device, non_blocking=True)
+                        reconstruction[:, -tail_points:, :]
+                        - batch_histories[:, -tail_points:, :].to(self.device, non_blocking=True)
                     ).float()
+                    reconstruction_error_t = reconstruction_error_t.mean(dim=1)
 
                 if self.cp is not None:
                     forecast_error = self.cp.from_dlpack(forecast_error_t)
@@ -1138,6 +1142,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_component_mismatch_score_weight": 0.0,
+    "tcn_reconstruction_tail_points": 1,
     "tcn_min_anomaly_run_length": 5,
     "tcn_max_gap_fill": 2,
     "tcn_device": "cuda",
@@ -1163,6 +1168,7 @@ SMALL_DATA_TCN_ARGS: dict[str, Any] = {
 
 TINY_DATA_FUSION_ARGS: dict[str, Any] = {
     "tcn_component_mismatch_score_weight": 0.2,
+    "tcn_reconstruction_tail_points": 4,
 }
 
 TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
@@ -1239,6 +1245,11 @@ def parse_args() -> argparse.Namespace:
         "--tcn-component-mismatch-score-weight",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_component_mismatch_score_weight"],
+    )
+    parser.add_argument(
+        "--tcn-reconstruction-tail-points",
+        type=int,
+        default=DEFAULT_TCN_ARGS["tcn_reconstruction_tail_points"],
     )
     parser.add_argument(
         "--tcn-min-anomaly-run-length",
@@ -1346,6 +1357,7 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         calibration_quantile=resolved["tcn_calibration_quantile"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         component_mismatch_score_weight=resolved["tcn_component_mismatch_score_weight"],
+        reconstruction_tail_points=resolved["tcn_reconstruction_tail_points"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
         max_gap_fill=resolved["tcn_max_gap_fill"],
         device=resolved["tcn_device"],
@@ -2045,14 +2057,13 @@ def run_tcn_split(
     tcn_config = build_tcn_config(args, split)
     pipeline = TcnAnomalyPipeline(target_channels=args.target_channels, config=tcn_config)
     training_summary = pipeline.fit(train_df, val_df=val_df)
-    short_run_min_points = 16 if split in {"1_months", "2_months"} else 20
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
     baseline_predictions = prune_short_isolated_runs(
         predictions=baseline_predictions,
         target_channels=args.target_channels,
-        min_run_points=short_run_min_points,
+        min_run_points=20,
         support_padding=8,
     )
     baseline_predictions = merge_supported_close_runs(
