@@ -1363,22 +1363,12 @@ def prune_short_isolated_runs(
     target_channels: list[str],
     min_run_points: int,
     support_padding: int,
-    scores: pd.DataFrame | None = None,
-    global_thresholds: np.ndarray | None = None,
-    min_peak_ratio: float = float("inf"),
-    min_mean_ratio: float = float("inf"),
 ) -> pd.DataFrame:
     pruned = predictions.copy()
     values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = None if scores is None else scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = None if global_thresholds is None else np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
         series = values[:, channel_index].copy()
-        channel_scores = None if score_values is None else score_values[:, channel_index]
-        threshold = None
-        if thresholds is not None:
-            threshold = max(float(thresholds[channel_index]), EPSILON)
         run_start: int | None = None
         for index, value in enumerate(series):
             if value == 1 and run_start is None:
@@ -1396,13 +1386,6 @@ def prune_short_isolated_runs(
                 support = values[support_start:support_stop].copy()
                 support[:, channel_index] = 0
                 if not support.any():
-                    if channel_scores is not None and threshold is not None:
-                        run_scores = channel_scores[run_start:run_stop]
-                        peak_ratio = float(run_scores.max()) / threshold
-                        mean_ratio = float(run_scores.mean()) / threshold
-                        if peak_ratio >= min_peak_ratio and mean_ratio >= min_mean_ratio:
-                            run_start = None
-                            continue
                     series[run_start:run_stop] = 0
             run_start = None
         if run_start is not None:
@@ -1413,13 +1396,6 @@ def prune_short_isolated_runs(
                 support = values[support_start:run_stop].copy()
                 support[:, channel_index] = 0
                 if not support.any():
-                    if channel_scores is not None and threshold is not None:
-                        run_scores = channel_scores[run_start:run_stop]
-                        peak_ratio = float(run_scores.max()) / threshold
-                        mean_ratio = float(run_scores.mean()) / threshold
-                        if peak_ratio >= min_peak_ratio and mean_ratio >= min_mean_ratio:
-                            pruned[channel] = series
-                            continue
                     series[run_start:run_stop] = 0
         pruned[channel] = series
 
@@ -2077,10 +2053,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         min_run_points=20,
         support_padding=8,
-        scores=baseline_scores if split in {"1_months", "2_months"} else None,
-        global_thresholds=pipeline.global_thresholds if split in {"1_months", "2_months"} else None,
-        min_peak_ratio=1.35,
-        min_mean_ratio=0.95,
     )
     baseline_predictions = merge_supported_close_runs(
         predictions=baseline_predictions,
