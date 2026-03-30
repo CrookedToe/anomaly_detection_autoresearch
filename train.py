@@ -1701,6 +1701,58 @@ def prune_noisy_channel_short_runs(
     return pruned
 
 
+def prune_low_support_memory_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    max_run_points: int,
+    max_support_channels: int,
+    max_peak_ratio: float,
+) -> pd.DataFrame:
+    pruned = predictions.copy()
+    prediction_values = pruned[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            run_length = run_stop - run_start
+            if run_length > max_run_points:
+                continue
+
+            support = prediction_values[run_start:run_stop].copy()
+            support[:, channel_index] = 0
+            max_support = int(support.sum(axis=1).max()) if len(support) else 0
+            if max_support > max_support_channels:
+                continue
+
+            peak_ratio = float(channel_scores[run_start:run_stop].max()) / threshold
+            if peak_ratio > max_peak_ratio:
+                continue
+
+            series[run_start:run_stop] = 0
+
+        prediction_values[:, channel_index] = series
+
+    pruned[target_channels] = prediction_values
+    return pruned
+
+
 def rescue_strong_detector_suppressions(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
@@ -1939,6 +1991,15 @@ def run_tcn_split(
         suppressed_events=suppressed_events,
         activation_matches=180,
         max_matches_per_prototype=160,
+    )
+    gated_predictions = prune_low_support_memory_runs(
+        predictions=gated_predictions,
+        scores=baseline_scores,
+        target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
+        max_run_points=14,
+        max_support_channels=1,
+        max_peak_ratio=3.0,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
