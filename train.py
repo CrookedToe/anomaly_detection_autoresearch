@@ -1726,6 +1726,61 @@ def extend_runs_with_cross_channel_support(
     return extended
 
 
+def extend_runs_with_cross_channel_score_support(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_support_channels: int,
+    min_score_ratio: float,
+    max_extension_points: int,
+) -> pd.DataFrame:
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    support_counts = prediction_values.sum(axis=1).astype(np.int16, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        extension_floor = threshold * min_score_ratio
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            left = run_start
+            while left > 0 and (run_start - left) < max_extension_points:
+                support = int(support_counts[left - 1]) - int(prediction_values[left - 1, channel_index])
+                if support < min_support_channels or channel_scores[left - 1] < extension_floor:
+                    break
+                left -= 1
+
+            right = run_stop
+            while right < len(series) and (right - run_stop) < max_extension_points:
+                support = int(support_counts[right]) - int(prediction_values[right, channel_index])
+                if support < min_support_channels or channel_scores[right] < extension_floor:
+                    break
+                right += 1
+
+            series[left:right] = 1
+            index = max(index, right)
+
+        prediction_values[:, channel_index] = series
+
+    extended[target_channels] = prediction_values
+    return extended
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -2079,6 +2134,16 @@ def run_tcn_split(
         min_support_channels=2,
         max_extension_points=8,
     )
+    if split == "1_months":
+        baseline_predictions = extend_runs_with_cross_channel_score_support(
+            predictions=baseline_predictions,
+            scores=baseline_scores,
+            target_channels=args.target_channels,
+            global_thresholds=pipeline.global_thresholds,
+            min_support_channels=2,
+            min_score_ratio=0.7,
+            max_extension_points=16,
+        )
     baseline_predictions = extend_high_confidence_run_tails(
         predictions=baseline_predictions,
         scores=baseline_scores,
