@@ -39,6 +39,22 @@ from prepare import (
     write_json,
 )
 
+MISSION1_LADDER_SPLITS = {f"{month}_months" for month in range(1, 11)} | {"81_months", "84_months"}
+MISSION2_LADDER_SPLITS = {"18_months", "21_months"}
+
+
+def patch_prepare_split_inference() -> None:
+    prepare_module = importlib.import_module("prepare")
+
+    def infer_mission_from_split(split: str) -> str | None:
+        if split in MISSION1_LADDER_SPLITS:
+            return "ESA-Mission1"
+        if split in MISSION2_LADDER_SPLITS:
+            return "ESA-Mission2"
+        return None
+
+    prepare_module.infer_mission_from_split = infer_mission_from_split
+
 
 @dataclass
 class TcnModelConfig:
@@ -2006,6 +2022,7 @@ def _build_run_payload(
 
 
 def main() -> None:
+    patch_prepare_split_inference()
     args = parse_args()
     args.results_root.mkdir(parents=True, exist_ok=True)
     run_started_at = datetime.now(timezone.utc).isoformat()
