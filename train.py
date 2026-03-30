@@ -2045,13 +2045,14 @@ def run_tcn_split(
     tcn_config = build_tcn_config(args, split)
     pipeline = TcnAnomalyPipeline(target_channels=args.target_channels, config=tcn_config)
     training_summary = pipeline.fit(train_df, val_df=val_df)
+    short_run_min_points = 16 if split in {"1_months", "2_months"} else 20
 
     log_debug(f"[tcn] scoring test split '{split}'")
     baseline_scores, baseline_predictions = pipeline.predict(test_df)
     baseline_predictions = prune_short_isolated_runs(
         predictions=baseline_predictions,
         target_channels=args.target_channels,
-        min_run_points=20,
+        min_run_points=short_run_min_points,
         support_padding=8,
     )
     baseline_predictions = merge_supported_close_runs(
