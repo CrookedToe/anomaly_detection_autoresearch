@@ -39,6 +39,43 @@ from prepare import (
     write_json,
 )
 
+MISSION1_SMALL_DATA_SPLITS = {f"{month}_months" for month in range(1, 11)}
+
+
+def patch_prepare_split_resolution() -> None:
+    prepare_module = importlib.import_module("prepare")
+    original_resolve_dataset_paths = prepare_module.resolve_dataset_paths
+
+    def resolve_dataset_paths(preprocessed_root: Path, split: str) -> tuple[Path, Path | None, Path]:
+        mission1_root = preprocessed_root / "multivariate" / "ESA-Mission1-semi-supervised"
+        mission2_root = preprocessed_root / "multivariate" / "ESA-Mission2-semi-supervised"
+
+        if split in MISSION1_SMALL_DATA_SPLITS:
+            train_path = mission1_root / f"{split}.train.csv"
+            val_path = mission1_root / "3_months.val.csv"
+            test_path = mission1_root / "84_months.test.csv"
+            if train_path.exists() and test_path.exists():
+                return train_path, val_path if val_path.exists() else None, test_path
+
+        if split == "84_months":
+            train_path = mission1_root / "81_months.train.csv"
+            val_path = mission1_root / "3_months.val.csv"
+            test_path = mission1_root / "84_months.test.csv"
+            if train_path.exists() and test_path.exists():
+                return train_path, val_path if val_path.exists() else None, test_path
+
+        if split in {"18_months", "21_months"}:
+            train_path = mission2_root / "18_months.train.csv"
+            val_path = mission2_root / "3_months.val.csv"
+            test_path = mission2_root / "21_months.test.csv"
+            if train_path.exists() and test_path.exists():
+                return train_path, val_path if val_path.exists() else None, test_path
+
+        return original_resolve_dataset_paths(preprocessed_root, split)
+
+    prepare_module.resolve_dataset_paths = resolve_dataset_paths
+
+
 @dataclass
 class TcnModelConfig:
     input_dim: int
@@ -1322,22 +1359,15 @@ def prune_short_isolated_runs(
 
 def merge_supported_close_runs(
     predictions: pd.DataFrame,
-    scores: pd.DataFrame,
     target_channels: list[str],
-    global_thresholds: np.ndarray,
     max_gap_points: int,
     support_padding: int,
-    min_gap_score_ratio: float,
 ) -> pd.DataFrame:
     merged = predictions.copy()
     values = merged[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
         series = values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
         zero_start: int | None = None
         for index, value in enumerate(series):
             if value == 0:
@@ -1348,10 +1378,6 @@ def merge_supported_close_runs(
                 continue
             gap_length = index - zero_start
             if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
-                gap_peak_ratio = float(channel_scores[zero_start:index].max()) / threshold
-                if gap_peak_ratio < min_gap_score_ratio:
-                    zero_start = None
-                    continue
                 support_start = max(0, zero_start - support_padding)
                 support_stop = min(len(series), index + support_padding)
                 support = values[support_start:support_stop].copy()
@@ -1771,12 +1797,9 @@ def run_tcn_split(
     )
     baseline_predictions = merge_supported_close_runs(
         predictions=baseline_predictions,
-        scores=baseline_scores,
         target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
         max_gap_points=8,
         support_padding=8,
-        min_gap_score_ratio=0.65,
     )
     baseline_predictions = prune_weak_isolated_runs(
         predictions=baseline_predictions,
@@ -2019,6 +2042,7 @@ def _build_run_payload(
 
 
 def main() -> None:
+    patch_prepare_split_resolution()
     args = parse_args()
     args.results_root.mkdir(parents=True, exist_ok=True)
     run_started_at = datetime.now(timezone.utc).isoformat()
