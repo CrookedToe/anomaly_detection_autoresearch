@@ -1662,8 +1662,6 @@ def rescue_strong_detector_suppressions(
     target_channels: list[str],
     global_thresholds: np.ndarray,
     min_peak_ratio: float,
-    min_supported_peak_ratio: float,
-    min_other_channel_points: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if suppressed_events.empty:
         return gated_predictions, suppressed_events
@@ -1692,17 +1690,6 @@ def rescue_strong_detector_suppressions(
         if peak_ratio >= min_peak_ratio:
             rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
             continue
-
-        other_channels = [candidate for candidate in target_channels if candidate != channel]
-        if other_channels:
-            other_channel_points = int(
-                baseline_predictions.loc[start_time:end_time, other_channels].to_numpy(dtype=np.uint8, copy=False).sum()
-            )
-            if other_channel_points >= min_other_channel_points and peak_ratio >= min_supported_peak_ratio:
-                rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(
-                    np.uint8
-                )
-                continue
 
         kept_rows.append(row)
 
@@ -1784,6 +1771,30 @@ def apply_same_channel_memory_gating(
     else:
         suppressed_events = pd.DataFrame(columns=["channel", "start_time", "end_time", "prototype_id", "score", "metric"])
     return gated_predictions, suppressed_events
+
+
+def deduplicate_memory_bank_by_event_channel(memory_bank: RareNominalMemoryBank) -> RareNominalMemoryBank:
+    if not memory_bank.prototypes:
+        return memory_bank
+
+    selected: dict[tuple[str, str], Any] = {}
+    durations: dict[tuple[str, str], float] = {}
+
+    for prototype in memory_bank.prototypes:
+        key = (prototype.event_id, prototype.channel)
+        start_time = pd.Timestamp(prototype.start_time)
+        end_time = pd.Timestamp(prototype.end_time)
+        duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
+        current_duration = durations.get(key)
+        if current_duration is None or duration_seconds > current_duration:
+            selected[key] = prototype
+            durations[key] = duration_seconds
+
+    ordered = sorted(
+        selected.values(),
+        key=lambda prototype: (pd.Timestamp(prototype.start_time), prototype.channel, prototype.event_id),
+    )
+    return RareNominalMemoryBank(ordered)
 
 
 def run_tcn_split(
@@ -1873,6 +1884,7 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
+    memory_bank = deduplicate_memory_bank_by_event_channel(memory_bank)
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
@@ -1892,8 +1904,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
-        min_supported_peak_ratio=3.5,
-        min_other_channel_points=1,
     )
     gated_predictions, suppressed_events = cap_overused_prototype_suppressions(
         baseline_predictions=baseline_predictions,
