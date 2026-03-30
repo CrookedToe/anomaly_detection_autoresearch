@@ -1884,6 +1884,56 @@ def rescue_strong_detector_suppressions(
     return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
+def rescue_supported_detector_suppressions(
+    baseline_predictions: pd.DataFrame,
+    gated_predictions: pd.DataFrame,
+    suppressed_events: pd.DataFrame,
+    target_channels: list[str],
+    min_run_points: int,
+    min_support_channels: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if suppressed_events.empty:
+        return gated_predictions, suppressed_events
+
+    rescued = gated_predictions.copy()
+    baseline_values = baseline_predictions[target_channels].to_numpy(dtype=np.uint8, copy=False)
+    support_counts = baseline_values.sum(axis=1).astype(np.int16, copy=False)
+    timestamp_index = baseline_predictions.index
+    kept_rows: list[dict[str, Any]] = []
+
+    for row in suppressed_events.to_dict(orient="records"):
+        channel = str(row["channel"])
+        if channel not in target_channels:
+            kept_rows.append(row)
+            continue
+
+        start_time = pd.Timestamp(row["start_time"])
+        end_time = pd.Timestamp(row["end_time"])
+        try:
+            start_idx = int(timestamp_index.get_indexer([start_time])[0])
+            end_idx = int(timestamp_index.get_indexer([end_time])[0])
+        except (KeyError, IndexError, TypeError, ValueError):
+            start_idx = -1
+            end_idx = -1
+
+        if start_idx < 0 or end_idx < start_idx:
+            kept_rows.append(row)
+            continue
+
+        channel_index = target_channels.index(channel)
+        run_length = (end_idx - start_idx) + 1
+        support_slice = support_counts[start_idx : end_idx + 1] - baseline_values[start_idx : end_idx + 1, channel_index]
+        max_support = int(support_slice.max()) if len(support_slice) else 0
+
+        if run_length >= min_run_points and max_support >= min_support_channels:
+            rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
+            continue
+
+        kept_rows.append(row)
+
+    return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+
+
 def cap_overused_prototype_suppressions(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
@@ -2084,6 +2134,15 @@ def run_tcn_split(
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
     )
+    if split in {"1_months", "2_months"}:
+        gated_predictions, suppressed_events = rescue_supported_detector_suppressions(
+            baseline_predictions=baseline_predictions,
+            gated_predictions=gated_predictions,
+            suppressed_events=suppressed_events,
+            target_channels=args.target_channels,
+            min_run_points=18,
+            min_support_channels=2,
+        )
     gated_predictions, suppressed_events = cap_overused_prototype_suppressions(
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
