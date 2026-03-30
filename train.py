@@ -39,23 +39,6 @@ from prepare import (
     write_json,
 )
 
-MISSION1_LADDER_SPLITS = {f"{month}_months" for month in range(1, 11)} | {"81_months", "84_months"}
-MISSION2_LADDER_SPLITS = {"18_months", "21_months"}
-
-
-def patch_prepare_split_inference() -> None:
-    prepare_module = importlib.import_module("prepare")
-
-    def infer_mission_from_split(split: str) -> str | None:
-        if split in MISSION1_LADDER_SPLITS:
-            return "ESA-Mission1"
-        if split in MISSION2_LADDER_SPLITS:
-            return "ESA-Mission2"
-        return None
-
-    prepare_module.infer_mission_from_split = infer_mission_from_split
-
-
 @dataclass
 class TcnModelConfig:
     input_dim: int
@@ -1087,7 +1070,7 @@ DEFAULT_TARGET_CHANNELS = [
     "channel_46",
 ]
 
-DEFAULT_AUTORESEARCH_SPLITS = ["9_months"]
+DEFAULT_AUTORESEARCH_SPLITS = ["10_months"]
 DEFAULT_AUTORESEARCH_DETECTORS = ["tcn"]
 
 DEFAULT_TCN_ARGS: dict[str, Any] = {
@@ -1339,15 +1322,22 @@ def prune_short_isolated_runs(
 
 def merge_supported_close_runs(
     predictions: pd.DataFrame,
+    scores: pd.DataFrame,
     target_channels: list[str],
+    global_thresholds: np.ndarray,
     max_gap_points: int,
     support_padding: int,
+    min_gap_score_ratio: float,
 ) -> pd.DataFrame:
     merged = predictions.copy()
     values = merged[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
 
     for channel_index, channel in enumerate(target_channels):
         series = values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
         zero_start: int | None = None
         for index, value in enumerate(series):
             if value == 0:
@@ -1358,6 +1348,10 @@ def merge_supported_close_runs(
                 continue
             gap_length = index - zero_start
             if zero_start > 0 and gap_length <= max_gap_points and series[zero_start - 1] == 1:
+                gap_peak_ratio = float(channel_scores[zero_start:index].max()) / threshold
+                if gap_peak_ratio < min_gap_score_ratio:
+                    zero_start = None
+                    continue
                 support_start = max(0, zero_start - support_padding)
                 support_stop = min(len(series), index + support_padding)
                 support = values[support_start:support_stop].copy()
@@ -1777,9 +1771,12 @@ def run_tcn_split(
     )
     baseline_predictions = merge_supported_close_runs(
         predictions=baseline_predictions,
+        scores=baseline_scores,
         target_channels=args.target_channels,
+        global_thresholds=pipeline.global_thresholds,
         max_gap_points=8,
         support_padding=8,
+        min_gap_score_ratio=0.65,
     )
     baseline_predictions = prune_weak_isolated_runs(
         predictions=baseline_predictions,
@@ -2022,7 +2019,6 @@ def _build_run_payload(
 
 
 def main() -> None:
-    patch_prepare_split_inference()
     args = parse_args()
     args.results_root.mkdir(parents=True, exist_ok=True)
     run_started_at = datetime.now(timezone.utc).isoformat()
