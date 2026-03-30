@@ -1777,21 +1777,6 @@ def cap_overused_prototype_suppressions(
     return rescued, pd.concat(kept_groups, ignore_index=True)
 
 
-def deduplicate_memory_prototypes_by_id(memory_bank: RareNominalMemoryBank) -> RareNominalMemoryBank:
-    if not memory_bank.prototypes:
-        return memory_bank
-
-    unique_prototypes: list[Any] = []
-    seen_ids: set[str] = set()
-    for prototype in memory_bank.prototypes:
-        prototype_id = str(prototype.prototype_id)
-        if prototype_id in seen_ids:
-            continue
-        seen_ids.add(prototype_id)
-        unique_prototypes.append(prototype)
-    return RareNominalMemoryBank(unique_prototypes)
-
-
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1928,7 +1913,6 @@ def run_tcn_split(
         half_window=resolved_args["half_window"],
         vectorizer=pipeline.vectorize_windows,
     )
-    memory_bank = deduplicate_memory_prototypes_by_id(memory_bank)
     log_debug(f"[tcn] applying memory gating for '{split}'")
     gated_predictions, suppressed_events = apply_same_channel_memory_gating(
         frame=test_df,
