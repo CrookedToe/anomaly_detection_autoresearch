@@ -1583,72 +1583,38 @@ def rescue_strong_detector_suppressions(
     return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
-def rescue_adjacent_channel_supported_suppressions(
+def cap_overused_prototype_suppressions(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
     suppressed_events: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_peak_ratio: float,
-    min_adjacent_support_points: int,
-    support_padding_points: int,
+    activation_matches: int,
+    max_matches_per_prototype: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if suppressed_events.empty:
         return gated_predictions, suppressed_events
 
     rescued = gated_predictions.copy()
-    thresholds = {
-        channel: max(float(global_thresholds[channel_index]), EPSILON)
-        for channel_index, channel in enumerate(target_channels)
-    }
-    channel_positions = {channel: channel_index for channel_index, channel in enumerate(target_channels)}
-    kept_rows: list[dict[str, Any]] = []
+    kept_groups: list[pd.DataFrame] = []
 
-    for row in suppressed_events.to_dict(orient="records"):
-        channel = str(row["channel"])
-        channel_position = channel_positions.get(channel)
-        if channel_position is None:
-            kept_rows.append(row)
+    for _, group in suppressed_events.groupby("prototype_id", sort=False):
+        if len(group) < activation_matches:
+            kept_groups.append(group)
             continue
 
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        run_scores = scores.loc[start_time:end_time, channel]
-        if run_scores.empty:
-            kept_rows.append(row)
-            continue
+        ranked = group.sort_values("score", ascending=False, kind="mergesort")
+        kept = ranked.iloc[:max_matches_per_prototype].copy()
+        rescued_rows = ranked.iloc[max_matches_per_prototype:]
+        for row in rescued_rows.itertuples(index=False):
+            start_time = pd.Timestamp(row.start_time)
+            end_time = pd.Timestamp(row.end_time)
+            rescued.loc[start_time:end_time, row.channel] = baseline_predictions.loc[start_time:end_time, row.channel].astype(
+                np.uint8
+            )
+        kept_groups.append(kept)
 
-        peak_ratio = float(run_scores.max()) / thresholds[channel]
-        if peak_ratio < min_peak_ratio:
-            kept_rows.append(row)
-            continue
-
-        event_start_index = baseline_predictions.index.get_indexer([start_time], method="nearest")[0]
-        event_end_index = baseline_predictions.index.get_indexer([end_time], method="nearest")[0]
-        support_start_index = max(0, min(event_start_index, event_end_index) - support_padding_points)
-        support_end_index = min(len(baseline_predictions.index), max(event_start_index, event_end_index) + support_padding_points + 1)
-
-        adjacent_channels: list[str] = []
-        if channel_position > 0:
-            adjacent_channels.append(target_channels[channel_position - 1])
-        if channel_position + 1 < len(target_channels):
-            adjacent_channels.append(target_channels[channel_position + 1])
-        if not adjacent_channels:
-            kept_rows.append(row)
-            continue
-
-        adjacent_support = baseline_predictions.iloc[support_start_index:support_end_index][adjacent_channels].to_numpy(
-            dtype=np.uint8,
-            copy=False,
-        )
-        if int(adjacent_support.sum()) < min_adjacent_support_points:
-            kept_rows.append(row)
-            continue
-
-        rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
-
-    return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
+    if not kept_groups:
+        return rescued, suppressed_events.iloc[0:0].copy()
+    return rescued, pd.concat(kept_groups, ignore_index=True)
 
 
 def apply_same_channel_memory_gating(
@@ -1801,16 +1767,12 @@ def run_tcn_split(
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
     )
-    gated_predictions, suppressed_events = rescue_adjacent_channel_supported_suppressions(
+    gated_predictions, suppressed_events = cap_overused_prototype_suppressions(
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
         suppressed_events=suppressed_events,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        min_peak_ratio=2.5,
-        min_adjacent_support_points=3,
-        support_padding_points=6,
+        activation_matches=180,
+        max_matches_per_prototype=160,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
