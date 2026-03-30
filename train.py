@@ -1143,6 +1143,15 @@ DEFAULT_MEMORY_ARGS: dict[str, Any] = {
     "memory_threshold": 0.92,
 }
 
+SMALL_DATA_TCN_ARGS: dict[str, Any] = {
+    "tcn_horizon": 4,
+    "tcn_learning_rate": 3e-4,
+    "tcn_epochs": 6,
+    "tcn_inference_stride": 8,
+    "tcn_score_smoothing_window": 3,
+    "tcn_min_anomaly_run_length": 4,
+}
+
 TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "best_10m": {
         "10_months": {
@@ -1263,6 +1272,21 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_split_parameters(args: argparse.Namespace, split: str) -> dict[str, Any]:
     resolved = vars(args).copy()
+
+    def apply_overrides(overrides: dict[str, Any]) -> None:
+        for key, value in overrides.items():
+            if key in DEFAULT_TCN_ARGS:
+                if resolved[key] == DEFAULT_TCN_ARGS[key]:
+                    resolved[key] = value
+                continue
+            if key in DEFAULT_MEMORY_ARGS and resolved[key] == DEFAULT_MEMORY_ARGS[key]:
+                resolved[key] = value
+
+    if split in MISSION1_SMALL_DATA_SPLITS:
+        month_count = int(split.split("_", maxsplit=1)[0])
+        if month_count <= 8:
+            apply_overrides(SMALL_DATA_TCN_ARGS)
+
     if args.tcn_preset == "none":
         return resolved
 
