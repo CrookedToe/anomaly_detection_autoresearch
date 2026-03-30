@@ -241,6 +241,7 @@ class TcnTrainingConfig:
     reconstruction_loss_weight: float = 0.5
     forecast_score_weight: float = 1.0
     reconstruction_score_weight: float = 0.35
+    component_mismatch_score_weight: float = 0.0
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
     calibration_quantile: float = 0.995
@@ -691,7 +692,14 @@ class TcnAnomalyPipeline:
         reconstruction_normalized = reconstruction_scores / reconstruction_scale
         dominant_component = np.maximum(forecast_normalized, reconstruction_normalized)
         supporting_component = np.minimum(forecast_normalized, reconstruction_normalized)
-        return dominant_component + (0.25 * supporting_component)
+        mismatch_component = np.abs(forecast_normalized - reconstruction_normalized)
+        return (
+            (self.config.forecast_score_weight * forecast_normalized)
+            + (self.config.reconstruction_score_weight * reconstruction_normalized)
+            + dominant_component
+            + (0.25 * supporting_component)
+            + (self.config.component_mismatch_score_weight * mismatch_component)
+        )
 
     def predict(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         scores = self.score_sequence(frame)
@@ -1129,6 +1137,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_threshold_std_factor": 4.0,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
+    "tcn_component_mismatch_score_weight": 0.0,
     "tcn_min_anomaly_run_length": 5,
     "tcn_max_gap_fill": 2,
     "tcn_device": "cuda",
@@ -1150,6 +1159,10 @@ SMALL_DATA_TCN_ARGS: dict[str, Any] = {
     "tcn_inference_stride": 8,
     "tcn_score_smoothing_window": 3,
     "tcn_min_anomaly_run_length": 4,
+}
+
+TINY_DATA_FUSION_ARGS: dict[str, Any] = {
+    "tcn_component_mismatch_score_weight": 0.2,
 }
 
 TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
@@ -1223,6 +1236,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TCN_ARGS["tcn_score_smoothing_window"],
     )
     parser.add_argument(
+        "--tcn-component-mismatch-score-weight",
+        type=float,
+        default=DEFAULT_TCN_ARGS["tcn_component_mismatch_score_weight"],
+    )
+    parser.add_argument(
         "--tcn-min-anomaly-run-length",
         type=int,
         default=DEFAULT_TCN_ARGS["tcn_min_anomaly_run_length"],
@@ -1286,6 +1304,8 @@ def resolve_split_parameters(args: argparse.Namespace, split: str) -> dict[str, 
         month_count = int(split.split("_", maxsplit=1)[0])
         if month_count <= 8:
             apply_overrides(SMALL_DATA_TCN_ARGS)
+        if month_count <= 2:
+            apply_overrides(TINY_DATA_FUSION_ARGS)
 
     if args.tcn_preset == "none":
         return resolved
@@ -1325,6 +1345,7 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
+        component_mismatch_score_weight=resolved["tcn_component_mismatch_score_weight"],
         min_anomaly_run_length=resolved["tcn_min_anomaly_run_length"],
         max_gap_fill=resolved["tcn_max_gap_fill"],
         device=resolved["tcn_device"],
