@@ -1709,7 +1709,6 @@ def rescue_strong_detector_suppressions(
     target_channels: list[str],
     global_thresholds: np.ndarray,
     min_peak_ratio: float,
-    min_run_points: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if suppressed_events.empty:
         return gated_predictions, suppressed_events
@@ -1731,10 +1730,6 @@ def rescue_strong_detector_suppressions(
 
         run_scores = scores.loc[start_time:end_time, channel]
         if run_scores.empty:
-            kept_rows.append(row)
-            continue
-
-        if len(run_scores) < min_run_points:
             kept_rows.append(row)
             continue
 
@@ -1936,8 +1931,7 @@ def run_tcn_split(
         scores=baseline_scores,
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
-        min_peak_ratio=3.8,
-        min_run_points=20,
+        min_peak_ratio=4.0,
     )
     gated_predictions, suppressed_events = cap_overused_prototype_suppressions(
         baseline_predictions=baseline_predictions,
