@@ -1590,6 +1590,53 @@ def extend_high_confidence_run_tails(
     return extended
 
 
+def extend_runs_with_cross_channel_support(
+    predictions: pd.DataFrame,
+    target_channels: list[str],
+    min_support_channels: int,
+    max_extension_points: int,
+) -> pd.DataFrame:
+    extended = predictions.copy()
+    prediction_values = extended[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    support_counts = prediction_values.sum(axis=1).astype(np.int16, copy=False)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        index = 0
+
+        while index < len(series):
+            if series[index] != 1:
+                index += 1
+                continue
+
+            run_start = index
+            while index < len(series) and series[index] == 1:
+                index += 1
+            run_stop = index
+
+            left = run_start
+            while left > 0 and (run_start - left) < max_extension_points:
+                support = int(support_counts[left - 1]) - int(prediction_values[left - 1, channel_index])
+                if support < min_support_channels:
+                    break
+                left -= 1
+
+            right = run_stop
+            while right < len(series) and (right - run_stop) < max_extension_points:
+                support = int(support_counts[right]) - int(prediction_values[right, channel_index])
+                if support < min_support_channels:
+                    break
+                right += 1
+
+            series[left:right] = 1
+            index = max(index, right)
+
+        prediction_values[:, channel_index] = series
+
+    extended[target_channels] = prediction_values
+    return extended
+
+
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1825,6 +1872,12 @@ def run_tcn_split(
         pre_points=1,
         post_points=0,
     )
+    baseline_predictions = extend_runs_with_cross_channel_support(
+        predictions=baseline_predictions,
+        target_channels=args.target_channels,
+        min_support_channels=2,
+        max_extension_points=8,
+    )
     baseline_predictions = extend_high_confidence_run_tails(
         predictions=baseline_predictions,
         scores=baseline_scores,
@@ -1884,8 +1937,8 @@ def run_tcn_split(
         baseline_predictions=baseline_predictions,
         gated_predictions=gated_predictions,
         suppressed_events=suppressed_events,
-        activation_matches=25,
-        max_matches_per_prototype=24,
+        activation_matches=180,
+        max_matches_per_prototype=160,
     )
 
     log_debug(f"[tcn] computing baseline ESA metrics for '{split}'")
