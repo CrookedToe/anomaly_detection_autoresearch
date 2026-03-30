@@ -1163,6 +1163,7 @@ SMALL_DATA_TCN_ARGS: dict[str, Any] = {
 
 TINY_DATA_FUSION_ARGS: dict[str, Any] = {
     "tcn_component_mismatch_score_weight": 0.2,
+    "tcn_inference_stride": 4,
 }
 
 TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
