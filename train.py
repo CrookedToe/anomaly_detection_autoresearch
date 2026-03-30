@@ -2070,6 +2070,16 @@ def run_tcn_split(
             min_gap_mean_ratio=0.6,
             min_endpoint_peak_ratio=1.15,
         )
+    if split in {"1_months", "2_months"}:
+        baseline_predictions = bridge_score_supported_gaps(
+            predictions=baseline_predictions,
+            scores=baseline_scores,
+            target_channels=args.target_channels,
+            global_thresholds=pipeline.global_thresholds,
+            max_gap_points=20,
+            min_gap_mean_ratio=0.45,
+            min_endpoint_peak_ratio=1.05,
+        )
     baseline_predictions = prune_weak_isolated_runs(
         predictions=baseline_predictions,
         scores=baseline_scores,
