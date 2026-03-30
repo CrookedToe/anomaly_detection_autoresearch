@@ -1747,55 +1747,6 @@ def extend_runs_with_cross_channel_support(
     return extended
 
 
-def activate_consensus_supported_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    min_support_channels: int,
-    min_score_ratio: float,
-    min_run_points: int,
-) -> pd.DataFrame:
-    activated = predictions.copy()
-    prediction_values = activated[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    base_prediction_values = prediction_values.copy()
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-    support_counts = base_prediction_values.sum(axis=1).astype(np.int16, copy=False)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        base_series = base_prediction_values[:, channel_index]
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        support_without_channel = support_counts - base_series
-        candidate = (
-            (base_series == 0)
-            & (support_without_channel >= min_support_channels)
-            & (channel_scores >= (threshold * min_score_ratio))
-        )
-
-        run_start: int | None = None
-        for index, is_candidate in enumerate(candidate):
-            if is_candidate:
-                if run_start is None:
-                    run_start = index
-                continue
-            if run_start is None:
-                continue
-            if index - run_start >= min_run_points:
-                series[run_start:index] = 1
-            run_start = None
-
-        if run_start is not None and len(series) - run_start >= min_run_points:
-            series[run_start:] = 1
-
-        prediction_values[:, channel_index] = series
-
-    activated[target_channels] = prediction_values
-    return activated
-
-
 def prune_noisy_channel_short_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -2149,16 +2100,6 @@ def run_tcn_split(
         min_support_channels=2,
         max_extension_points=8,
     )
-    if split in {"1_months", "2_months"}:
-        baseline_predictions = activate_consensus_supported_runs(
-            predictions=baseline_predictions,
-            scores=baseline_scores,
-            target_channels=args.target_channels,
-            global_thresholds=pipeline.global_thresholds,
-            min_support_channels=3,
-            min_score_ratio=0.85,
-            min_run_points=6,
-        )
     baseline_predictions = extend_high_confidence_run_tails(
         predictions=baseline_predictions,
         scores=baseline_scores,
