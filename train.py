@@ -1390,68 +1390,6 @@ def merge_supported_close_runs(
     return merged
 
 
-def merge_score_supported_close_runs(
-    predictions: pd.DataFrame,
-    scores: pd.DataFrame,
-    target_channels: list[str],
-    global_thresholds: np.ndarray,
-    max_gap_points: int,
-    min_gap_mean_ratio: float,
-    min_gap_peak_ratio: float,
-    min_run_peak_ratio: float,
-) -> pd.DataFrame:
-    merged = predictions.copy()
-    prediction_values = merged[target_channels].to_numpy(dtype=np.uint8, copy=True)
-    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
-    thresholds = np.asarray(global_thresholds, dtype=np.float32)
-
-    for channel_index, channel in enumerate(target_channels):
-        series = prediction_values[:, channel_index].copy()
-        channel_scores = score_values[:, channel_index]
-        threshold = max(float(thresholds[channel_index]), EPSILON)
-        index = 0
-
-        while index < len(series):
-            if series[index] != 1:
-                index += 1
-                continue
-
-            left_start = index
-            while index < len(series) and series[index] == 1:
-                index += 1
-            left_stop = index
-
-            gap_start = index
-            while index < len(series) and series[index] == 0:
-                index += 1
-            gap_stop = index
-            gap_length = gap_stop - gap_start
-            if gap_length == 0 or gap_length > max_gap_points or gap_stop >= len(series) or series[gap_stop] != 1:
-                continue
-
-            right_start = gap_stop
-            while index < len(series) and series[index] == 1:
-                index += 1
-            right_stop = index
-
-            left_peak = float(channel_scores[left_start:left_stop].max())
-            right_peak = float(channel_scores[right_start:right_stop].max())
-            if left_peak < (threshold * min_run_peak_ratio) or right_peak < (threshold * min_run_peak_ratio):
-                continue
-
-            gap_scores = channel_scores[gap_start:gap_stop]
-            gap_mean = float(gap_scores.mean())
-            gap_peak = float(gap_scores.max())
-            if gap_mean < (threshold * min_gap_mean_ratio) and gap_peak < (threshold * min_gap_peak_ratio):
-                continue
-
-            series[gap_start:gap_stop] = 1
-
-        merged[channel] = series
-
-    return merged
-
-
 def prune_weak_isolated_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -1909,16 +1847,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         max_gap_points=8,
         support_padding=8,
-    )
-    baseline_predictions = merge_score_supported_close_runs(
-        predictions=baseline_predictions,
-        scores=baseline_scores,
-        target_channels=args.target_channels,
-        global_thresholds=pipeline.global_thresholds,
-        max_gap_points=6,
-        min_gap_mean_ratio=0.55,
-        min_gap_peak_ratio=0.8,
-        min_run_peak_ratio=1.1,
     )
     baseline_predictions = prune_weak_isolated_runs(
         predictions=baseline_predictions,
