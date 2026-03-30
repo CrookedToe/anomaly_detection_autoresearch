@@ -691,7 +691,8 @@ class TcnAnomalyPipeline:
         reconstruction_normalized = reconstruction_scores / reconstruction_scale
         dominant_component = np.maximum(forecast_normalized, reconstruction_normalized)
         supporting_component = np.minimum(forecast_normalized, reconstruction_normalized)
-        return dominant_component + (0.25 * supporting_component)
+        agreement_component = np.sqrt(np.maximum(forecast_normalized, 0.0) * np.maximum(reconstruction_normalized, 0.0))
+        return dominant_component + (0.1 * supporting_component) + (0.2 * agreement_component)
 
     def predict(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         scores = self.score_sequence(frame)
