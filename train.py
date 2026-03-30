@@ -1071,7 +1071,7 @@ DEFAULT_TARGET_CHANNELS = [
     "channel_46",
 ]
 
-DEFAULT_AUTORESEARCH_SPLITS = ["10_months"]
+DEFAULT_AUTORESEARCH_SPLITS = ["9_months"]
 DEFAULT_AUTORESEARCH_DETECTORS = ["tcn"]
 
 DEFAULT_TCN_ARGS: dict[str, Any] = {
@@ -1660,54 +1660,6 @@ def rescue_strong_detector_suppressions(
     return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
 
 
-def rescue_duration_mismatched_suppressions(
-    baseline_predictions: pd.DataFrame,
-    gated_predictions: pd.DataFrame,
-    suppressed_events: pd.DataFrame,
-    memory_bank: RareNominalMemoryBank,
-    min_duration_ratio: float,
-    min_similarity_score: float,
-    min_run_seconds: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if suppressed_events.empty:
-        return gated_predictions, suppressed_events
-
-    rescued = gated_predictions.copy()
-    prototype_durations: dict[tuple[str, str], float] = {}
-    for prototype in memory_bank.prototypes:
-        start_time = pd.Timestamp(prototype.start_time)
-        end_time = pd.Timestamp(prototype.end_time)
-        prototype_durations[(prototype.prototype_id, prototype.channel)] = max(
-            (end_time - start_time).total_seconds() + 30.0,
-            30.0,
-        )
-    kept_rows: list[dict[str, Any]] = []
-
-    for row in suppressed_events.to_dict(orient="records"):
-        channel = str(row["channel"])
-        start_time = pd.Timestamp(row["start_time"])
-        end_time = pd.Timestamp(row["end_time"])
-        prototype_duration = prototype_durations.get((str(row["prototype_id"]), channel))
-        if prototype_duration is None:
-            kept_rows.append(row)
-            continue
-
-        run_seconds = max((end_time - start_time).total_seconds() + 30.0, 30.0)
-        duration_ratio = run_seconds / prototype_duration
-        similarity_score = float(row["score"])
-        if (
-            run_seconds >= min_run_seconds
-            and duration_ratio >= min_duration_ratio
-            and similarity_score >= min_similarity_score
-        ):
-            rescued.loc[start_time:end_time, channel] = baseline_predictions.loc[start_time:end_time, channel].astype(np.uint8)
-            continue
-
-        kept_rows.append(row)
-
-    return rescued, pd.DataFrame(kept_rows, columns=suppressed_events.columns)
-
-
 def cap_overused_prototype_suppressions(
     baseline_predictions: pd.DataFrame,
     gated_predictions: pd.DataFrame,
@@ -1891,15 +1843,6 @@ def run_tcn_split(
         target_channels=args.target_channels,
         global_thresholds=pipeline.global_thresholds,
         min_peak_ratio=4.0,
-    )
-    gated_predictions, suppressed_events = rescue_duration_mismatched_suppressions(
-        baseline_predictions=baseline_predictions,
-        gated_predictions=gated_predictions,
-        suppressed_events=suppressed_events,
-        memory_bank=memory_bank,
-        min_duration_ratio=4.0,
-        min_similarity_score=0.99,
-        min_run_seconds=450.0,
     )
     gated_predictions, suppressed_events = cap_overused_prototype_suppressions(
         baseline_predictions=baseline_predictions,
