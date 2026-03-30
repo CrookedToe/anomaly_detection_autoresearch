@@ -1777,6 +1777,54 @@ def cap_overused_prototype_suppressions(
     return rescued, pd.concat(kept_groups, ignore_index=True)
 
 
+def build_channel_focused_vectorizer(
+    vectorizer: Any,
+    target_channels: list[str],
+    focus_channel: str,
+) -> Any:
+    focus_index = target_channels.index(focus_channel)
+
+    def vectorize(windows: list[pd.DataFrame] | np.ndarray) -> np.ndarray:
+        if isinstance(windows, np.ndarray):
+            focused_windows = np.zeros_like(windows)
+            focused_windows[:, :, focus_index] = windows[:, :, focus_index]
+            return vectorizer(focused_windows)
+
+        focused_frames: list[pd.DataFrame] = []
+        for window in windows:
+            focused_window = window.copy()
+            for channel in target_channels:
+                if channel != focus_channel:
+                    focused_window[channel] = 0.0
+            focused_frames.append(focused_window)
+        return vectorizer(focused_frames)
+
+    return vectorize
+
+
+def build_channel_focused_memory_bank(
+    frame: pd.DataFrame,
+    labels: pd.DataFrame,
+    target_channels: list[str],
+    half_window: int,
+    vectorizer: Any,
+) -> RareNominalMemoryBank:
+    prototypes: list[Any] = []
+    for channel in target_channels:
+        channel_labels = labels.loc[labels["Channel"] == channel].copy()
+        if channel_labels.empty:
+            continue
+        channel_bank = RareNominalMemoryBank.from_labeled_rare_events(
+            frame=frame,
+            labels=channel_labels,
+            target_channels=target_channels,
+            half_window=half_window,
+            vectorizer=build_channel_focused_vectorizer(vectorizer, target_channels, channel),
+        )
+        prototypes.extend(channel_bank.prototypes)
+    return RareNominalMemoryBank(prototypes)
+
+
 def apply_same_channel_memory_gating(
     frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -1786,6 +1834,7 @@ def apply_same_channel_memory_gating(
     metric: str,
     threshold: float,
     vectorizer: Any | None = None,
+    channel_vectorizers: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     gated_predictions = predictions.copy()
     suppressed_frames: list[pd.DataFrame] = []
@@ -1807,7 +1856,7 @@ def apply_same_channel_memory_gating(
             half_window=half_window,
             metric=metric,
             threshold=threshold,
-            vectorizer=vectorizer,
+            vectorizer=channel_vectorizers.get(channel, vectorizer) if channel_vectorizers is not None else vectorizer,
         )
         gated_predictions[channel] = channel_gated[channel].astype(np.uint8)
         if not channel_suppressed.empty:
@@ -1906,7 +1955,11 @@ def run_tcn_split(
     write_json(baseline_dir / "training.json", training_summary)
 
     log_debug(f"[tcn] building memory bank for '{split}'")
-    memory_bank = RareNominalMemoryBank.from_labeled_rare_events(
+    channel_vectorizers = {
+        channel: build_channel_focused_vectorizer(pipeline.vectorize_windows, args.target_channels, channel)
+        for channel in args.target_channels
+    }
+    memory_bank = build_channel_focused_memory_bank(
         frame=train_df,
         labels=train_labels,
         target_channels=args.target_channels,
@@ -1923,6 +1976,7 @@ def run_tcn_split(
         metric=args.metric,
         threshold=resolved_args["memory_threshold"],
         vectorizer=pipeline.vectorize_windows,
+        channel_vectorizers=channel_vectorizers,
     )
     gated_predictions, suppressed_events = rescue_strong_detector_suppressions(
         baseline_predictions=baseline_predictions,
