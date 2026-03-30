@@ -1479,6 +1479,66 @@ def bridge_score_supported_gaps(
     return bridged
 
 
+def promote_supported_near_threshold_runs(
+    predictions: pd.DataFrame,
+    scores: pd.DataFrame,
+    target_channels: list[str],
+    global_thresholds: np.ndarray,
+    min_run_points: int,
+    min_score_ratio: float,
+    min_support_channels: int,
+    min_supported_points: int,
+) -> pd.DataFrame:
+    promoted = predictions.copy()
+    prediction_values = promoted[target_channels].to_numpy(dtype=np.uint8, copy=True)
+    score_values = scores[target_channels].to_numpy(dtype=np.float32, copy=False)
+    thresholds = np.asarray(global_thresholds, dtype=np.float32)
+    support_counts = prediction_values.sum(axis=1).astype(np.int16, copy=False)
+
+    for channel_index, channel in enumerate(target_channels):
+        series = prediction_values[:, channel_index].copy()
+        channel_scores = score_values[:, channel_index]
+        threshold = max(float(thresholds[channel_index]), EPSILON)
+        candidate = (
+            (series == 0)
+            & (channel_scores >= (threshold * min_score_ratio))
+            & ((support_counts - prediction_values[:, channel_index]) >= min_support_channels)
+        )
+
+        run_start: int | None = None
+        for index, is_candidate in enumerate(candidate):
+            if is_candidate and run_start is None:
+                run_start = index
+                continue
+            if is_candidate:
+                continue
+            if run_start is None:
+                continue
+
+            run_stop = index
+            run_length = run_stop - run_start
+            supported_points = int(
+                ((support_counts[run_start:run_stop] - prediction_values[run_start:run_stop, channel_index]) >= min_support_channels).sum()
+            )
+            if run_length >= min_run_points and supported_points >= min_supported_points:
+                series[run_start:run_stop] = 1
+            run_start = None
+
+        if run_start is not None:
+            run_stop = len(series)
+            run_length = run_stop - run_start
+            supported_points = int(
+                ((support_counts[run_start:run_stop] - prediction_values[run_start:run_stop, channel_index]) >= min_support_channels).sum()
+            )
+            if run_length >= min_run_points and supported_points >= min_supported_points:
+                series[run_start:run_stop] = 1
+
+        prediction_values[:, channel_index] = series
+
+    promoted[target_channels] = prediction_values
+    return promoted
+
+
 def prune_weak_isolated_runs(
     predictions: pd.DataFrame,
     scores: pd.DataFrame,
@@ -2048,6 +2108,17 @@ def run_tcn_split(
             max_gap_points=12,
             min_gap_mean_ratio=0.6,
             min_endpoint_peak_ratio=1.15,
+        )
+    if split == "1_months":
+        baseline_predictions = promote_supported_near_threshold_runs(
+            predictions=baseline_predictions,
+            scores=baseline_scores,
+            target_channels=args.target_channels,
+            global_thresholds=pipeline.global_thresholds,
+            min_run_points=12,
+            min_score_ratio=0.88,
+            min_support_channels=2,
+            min_supported_points=8,
         )
     baseline_predictions = prune_weak_isolated_runs(
         predictions=baseline_predictions,
