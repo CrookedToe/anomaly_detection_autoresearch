@@ -244,7 +244,6 @@ class TcnTrainingConfig:
     component_mismatch_score_weight: float = 0.0
     threshold_window: int = 288
     threshold_std_factor: float = 4.0
-    dynamic_threshold_cap_ratio: float = 0.0
     calibration_quantile: float = 0.995
     score_smoothing_window: int = 5
     min_anomaly_run_length: int = 5
@@ -958,9 +957,6 @@ class TcnAnomalyPipeline:
             ).median()
             dynamic_threshold = rolling_median + (self.config.threshold_std_factor * 1.4826 * rolling_mad.fillna(0.0))
             threshold = np.maximum(dynamic_threshold.fillna(global_thresholds[channel_index]), global_thresholds[channel_index])
-            if self.config.dynamic_threshold_cap_ratio > 1.0 and global_thresholds[channel_index] > 0.0:
-                threshold_cap = global_thresholds[channel_index] * self.config.dynamic_threshold_cap_ratio
-                threshold = np.minimum(threshold, threshold_cap)
             raw_prediction = (smoothed_series > threshold).astype(np.uint8).to_numpy(copy=True)
             thresholded[channel] = self._postprocess_prediction_runs(raw_prediction)
 
@@ -1139,7 +1135,6 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_inference_stride": 16,
     "tcn_threshold_window": 288,
     "tcn_threshold_std_factor": 4.0,
-    "tcn_dynamic_threshold_cap_ratio": 0.0,
     "tcn_calibration_quantile": 0.995,
     "tcn_score_smoothing_window": 5,
     "tcn_component_mismatch_score_weight": 0.0,
@@ -1168,10 +1163,6 @@ SMALL_DATA_TCN_ARGS: dict[str, Any] = {
 
 TINY_DATA_FUSION_ARGS: dict[str, Any] = {
     "tcn_component_mismatch_score_weight": 0.2,
-}
-
-TINY_DATA_THRESHOLD_ARGS: dict[str, Any] = {
-    "tcn_dynamic_threshold_cap_ratio": 1.75,
 }
 
 TCN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
@@ -1233,11 +1224,6 @@ def parse_args() -> argparse.Namespace:
         "--tcn-threshold-std-factor",
         type=float,
         default=DEFAULT_TCN_ARGS["tcn_threshold_std_factor"],
-    )
-    parser.add_argument(
-        "--tcn-dynamic-threshold-cap-ratio",
-        type=float,
-        default=DEFAULT_TCN_ARGS["tcn_dynamic_threshold_cap_ratio"],
     )
     parser.add_argument(
         "--tcn-calibration-quantile",
@@ -1320,7 +1306,6 @@ def resolve_split_parameters(args: argparse.Namespace, split: str) -> dict[str, 
             apply_overrides(SMALL_DATA_TCN_ARGS)
         if month_count <= 2:
             apply_overrides(TINY_DATA_FUSION_ARGS)
-            apply_overrides(TINY_DATA_THRESHOLD_ARGS)
 
     if args.tcn_preset == "none":
         return resolved
@@ -1358,7 +1343,6 @@ def build_tcn_config(args: argparse.Namespace, split: str) -> TcnTrainingConfig:
         inference_stride=resolved["tcn_inference_stride"],
         threshold_window=resolved["tcn_threshold_window"],
         threshold_std_factor=resolved["tcn_threshold_std_factor"],
-        dynamic_threshold_cap_ratio=resolved["tcn_dynamic_threshold_cap_ratio"],
         calibration_quantile=resolved["tcn_calibration_quantile"],
         score_smoothing_window=resolved["tcn_score_smoothing_window"],
         component_mismatch_score_weight=resolved["tcn_component_mismatch_score_weight"],
