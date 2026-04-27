@@ -1133,7 +1133,7 @@ DEFAULT_TCN_ARGS: dict[str, Any] = {
     "tcn_batch_size": 2048,
     "tcn_learning_rate": 5e-4,
     "tcn_weight_decay": 1e-4,
-    "tcn_epochs": 4,
+    "tcn_epochs": 10,
     "tcn_mask_ratio": 0.15,
     "tcn_train_stride": 8,
     "tcn_inference_stride": 16,

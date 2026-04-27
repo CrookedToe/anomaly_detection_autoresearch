@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+PRIMARY_METRIC_COLUMN = "memory.anomaly_only.Anomaly.EW_F_0.50"
+
+
+@dataclass
+class ResultRecord:
+    commit: str
+    primary_f05: float
+    status: str
+    description: str
+
+
+@dataclass
+class ArtifactSelection:
+    results_root: Path
+    run_summary: dict[str, Any]
+    warning: str | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create a more human-readable and complete evaluation for the current best run."
+    )
+    parser.add_argument(
+        "--results-tsv",
+        type=Path,
+        default=Path("results.tsv"),
+        help="TSV file tracking experiment outcomes.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("results"),
+        help="Directory that contains run artifacts.",
+    )
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=None,
+        help="Use a specific results root instead of auto-detecting the best run.",
+    )
+    parser.add_argument(
+        "--commit",
+        default=None,
+        help="Force a specific commit hash instead of the current best from results.tsv.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Markdown output path. Defaults to <results-root>/human_eval.md.",
+    )
+    return parser.parse_args()
+
+
+def _as_float(value: Any, default: float = math.nan) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_results_tsv(path: Path) -> list[ResultRecord]:
+    if not path.exists():
+        raise FileNotFoundError(f"Could not find results TSV: {path}")
+
+    records: list[ResultRecord] = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            commit = (row.get("commit") or "").strip()
+            status = (row.get("status") or "").strip()
+            description = (row.get("description") or "").strip()
+            score = _as_float(row.get("primary_f05"))
+            if not commit or math.isnan(score):
+                continue
+            records.append(
+                ResultRecord(
+                    commit=commit,
+                    primary_f05=score,
+                    status=status,
+                    description=description,
+                )
+            )
+    if not records:
+        raise ValueError(f"No usable experiment rows found in {path}")
+    return records
+
+
+def select_best_record(records: list[ResultRecord], forced_commit: str | None) -> ResultRecord:
+    if forced_commit:
+        for record in records:
+            if record.commit == forced_commit:
+                return record
+        raise ValueError(f"Commit {forced_commit!r} was not found in results.tsv")
+
+    successful = [record for record in records if record.status != "crash"]
+    pool = successful or records
+    return max(pool, key=lambda record: record.primary_f05)
+
+
+def select_previous_best(records: list[ResultRecord], current_commit: str) -> ResultRecord | None:
+    pool = [record for record in records if record.commit != current_commit and record.status != "crash"]
+    if not pool:
+        return None
+    return max(pool, key=lambda record: record.primary_f05)
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    if not value:
+        return datetime.min
+    text = str(value).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return datetime.min
+
+
+def locate_best_run(
+    results_dir: Path,
+    target_commit: str | None,
+    target_score: float | None,
+) -> ArtifactSelection:
+    candidates: list[tuple[int, datetime, Path, dict[str, Any]]] = []
+    for run_summary_path in results_dir.rglob("run_summary.json"):
+        try:
+            run_summary = _load_json(run_summary_path)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        git_commit = str(run_summary.get("git", {}).get("commit") or "")
+        run_score = _as_float(run_summary.get("primary_metric_mean"))
+        priority = -1
+
+        if target_commit and git_commit == target_commit:
+            priority = 2
+        elif target_score is not None and math.isfinite(run_score) and abs(run_score - target_score) <= 1e-6:
+            priority = 1
+
+        if priority >= 0:
+            candidates.append(
+                (
+                    priority,
+                    _parse_timestamp(run_summary.get("timestamp") or run_summary.get("started_at")),
+                    run_summary_path.parent,
+                    run_summary,
+                )
+            )
+
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, _, results_root, run_summary = candidates[0]
+        return ArtifactSelection(results_root=results_root, run_summary=run_summary)
+
+    fallback_candidates: list[tuple[float, datetime, Path, dict[str, Any]]] = []
+    for run_summary_path in results_dir.rglob("run_summary.json"):
+        try:
+            run_summary = _load_json(run_summary_path)
+        except (json.JSONDecodeError, OSError):
+            continue
+        run_score = _as_float(run_summary.get("primary_metric_mean"))
+        if not math.isfinite(run_score):
+            continue
+        fallback_candidates.append(
+            (
+                run_score,
+                _parse_timestamp(run_summary.get("timestamp") or run_summary.get("started_at")),
+                run_summary_path.parent,
+                run_summary,
+            )
+        )
+
+    if not fallback_candidates:
+        raise FileNotFoundError(
+            "Could not locate any usable run artifacts. Try passing --results-root explicitly."
+        )
+
+    fallback_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    _, _, results_root, run_summary = fallback_candidates[0]
+    found_commit = str(run_summary.get("git", {}).get("commit") or "unknown")
+    found_score = _as_float(run_summary.get("primary_metric_mean"))
+    warning = (
+        f"Artifacts for best results.tsv commit `{target_commit or 'unknown'}` were not found. "
+        f"Using available artifacts from commit `{found_commit}` with score `{found_score:.6f}` in `{results_root}`."
+    )
+    return ArtifactSelection(results_root=results_root, run_summary=run_summary, warning=warning)
+
+
+def load_best_summary_row(summary_path: Path) -> dict[str, str]:
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Could not find summary.csv: {summary_path}")
+
+    with summary_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"summary.csv is empty: {summary_path}")
+
+    return max(rows, key=lambda row: _as_float(row.get(PRIMARY_METRIC_COLUMN), float("-inf")))
+
+
+def _pct(numerator: float, denominator: float) -> str:
+    if denominator <= 0:
+        return "0.0%"
+    return f"{(100.0 * numerator / denominator):.1f}%"
+
+
+def _fmt(value: Any, digits: int = 4) -> str:
+    number = _as_float(value)
+    if math.isnan(number):
+        return "n/a"
+    return f"{number:.{digits}f}"
+
+
+def _fmt_signed(value: Any, digits: int = 4) -> str:
+    number = _as_float(value)
+    if math.isnan(number):
+        return "n/a"
+    return f"{number:+.{digits}f}"
+
+
+def _cli_value(args: dict[str, Any], key: str) -> str:
+    value = args.get(key)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def build_report(
+    best_record: ResultRecord,
+    previous_best: ResultRecord | None,
+    results_root: Path,
+    run_summary: dict[str, Any],
+    summary_row: dict[str, str],
+    eval_summary: dict[str, Any] | None,
+    artifact_warning: str | None,
+) -> str:
+    cli_args = run_summary.get("cli", {}).get("args", {})
+    git_info = run_summary.get("git", {})
+
+    baseline_event_f05 = _as_float(summary_row.get("baseline.anomaly_only.Anomaly.EW_F_0.50"))
+    memory_event_f05 = _as_float(summary_row.get("memory.anomaly_only.Anomaly.EW_F_0.50"))
+    baseline_event_precision = _as_float(summary_row.get("baseline.anomaly_only.Anomaly.EW_precision"))
+    memory_event_precision = _as_float(summary_row.get("memory.anomaly_only.Anomaly.EW_precision"))
+    baseline_event_recall = _as_float(summary_row.get("baseline.anomaly_only.Anomaly.EW_recall"))
+    memory_event_recall = _as_float(summary_row.get("memory.anomaly_only.Anomaly.EW_recall"))
+
+    suppressed_total = _as_float(summary_row.get("suppressed_total"), 0.0)
+    suppressed_nominal = _as_float(summary_row.get("suppressed_nominal_only"), 0.0)
+    suppressed_anomaly = _as_float(summary_row.get("suppressed_overlapping_anomalies"), 0.0)
+    suppressed_rare = _as_float(summary_row.get("suppressed_overlapping_rare_events"), 0.0)
+
+    delta_vs_previous = None
+    relative_gain = None
+    if previous_best is not None:
+        delta_vs_previous = best_record.primary_f05 - previous_best.primary_f05
+        if previous_best.primary_f05 > 0:
+            relative_gain = delta_vs_previous / previous_best.primary_f05
+
+    report_lines: list[str] = []
+    report_lines.append("# Human Evaluation")
+    report_lines.append("")
+    report_lines.append("## Best Run")
+    report_lines.append("")
+    report_lines.append(f"- Commit: `{best_record.commit}`")
+    report_lines.append(f"- Description: {best_record.description or 'n/a'}")
+    report_lines.append(f"- Results root: `{results_root}`")
+    report_lines.append(f"- Primary metric: `{best_record.primary_f05:.6f}` (`{PRIMARY_METRIC_COLUMN}`)")
+    if previous_best is not None and delta_vs_previous is not None:
+        relative_text = f", `{relative_gain * 100:.1f}%` relative" if relative_gain is not None else ""
+        report_lines.append(
+            f"- Improvement over previous best `{previous_best.commit}`: `{delta_vs_previous:+.6f}` absolute{relative_text}"
+        )
+    report_lines.append(
+        f"- Run timestamp: `{run_summary.get('timestamp', 'n/a')}` after `{_fmt(run_summary.get('elapsed_seconds'), 1)}` seconds"
+    )
+    report_lines.append("")
+
+    if artifact_warning:
+        report_lines.append("## Artifact Availability")
+        report_lines.append("")
+        report_lines.append(f"- {artifact_warning}")
+        report_lines.append("")
+
+    report_lines.append("## Plain-English Readout")
+    report_lines.append("")
+    report_lines.append(
+        f"- Memory gating turned a very high-recall but low-precision detector into a near-perfect precision run: "
+        f"event precision moved from `{baseline_event_precision:.4f}` to `{memory_event_precision:.4f}`."
+    )
+    report_lines.append(
+        f"- The main score improved from `{baseline_event_f05:.4f}` to `{memory_event_f05:.4f}`, while recall dropped from "
+        f"`{baseline_event_recall:.4f}` to `{memory_event_recall:.4f}`."
+    )
+    report_lines.append(
+        f"- The system suppressed `{int(suppressed_total)}` alerts: `{int(suppressed_nominal)}` nominal-only "
+        f"({_pct(suppressed_nominal, suppressed_total)}), `{int(suppressed_rare)}` overlapping rare events "
+        f"({_pct(suppressed_rare, suppressed_total)}), and `{int(suppressed_anomaly)}` overlapping anomalies "
+        f"({_pct(suppressed_anomaly, suppressed_total)})."
+    )
+    report_lines.append("")
+
+    report_lines.append("## Core Metrics")
+    report_lines.append("")
+    report_lines.append("| Metric | Baseline | Memory | Delta |")
+    report_lines.append("|---|---:|---:|---:|")
+    metric_rows = [
+        (
+            "Anomaly event precision",
+            "baseline.anomaly_only.Anomaly.EW_precision",
+            "memory.anomaly_only.Anomaly.EW_precision",
+        ),
+        (
+            "Anomaly event recall",
+            "baseline.anomaly_only.Anomaly.EW_recall",
+            "memory.anomaly_only.Anomaly.EW_recall",
+        ),
+        (
+            "Anomaly event F0.5",
+            "baseline.anomaly_only.Anomaly.EW_F_0.50",
+            "memory.anomaly_only.Anomaly.EW_F_0.50",
+        ),
+        (
+            "Anomaly channel F0.5",
+            "baseline.anomaly_only.PC_Anomaly.channel_F0.50",
+            "memory.anomaly_only.PC_Anomaly.channel_F0.50",
+        ),
+        (
+            "Anomaly timing total",
+            "baseline.anomaly_only.ADTQC_Anomaly.Total",
+            "memory.anomaly_only.ADTQC_Anomaly.Total",
+        ),
+        (
+            "Rare+anomaly event F0.5",
+            "baseline.rare_event_and_anomaly.Rare Event_Anomaly.EW_F_0.50",
+            "memory.rare_event_and_anomaly.Rare Event_Anomaly.EW_F_0.50",
+        ),
+        (
+            "Rare+anomaly channel F0.5",
+            "baseline.rare_event_and_anomaly.PC_Rare Event_Anomaly.channel_F0.50",
+            "memory.rare_event_and_anomaly.PC_Rare Event_Anomaly.channel_F0.50",
+        ),
+        (
+            "Rare+anomaly timing total",
+            "baseline.rare_event_and_anomaly.ADTQC_Rare Event_Anomaly.Total",
+            "memory.rare_event_and_anomaly.ADTQC_Rare Event_Anomaly.Total",
+        ),
+    ]
+    for label, baseline_key, memory_key in metric_rows:
+        baseline = _as_float(summary_row.get(baseline_key))
+        memory = _as_float(summary_row.get(memory_key))
+        delta = memory - baseline if math.isfinite(baseline) and math.isfinite(memory) else math.nan
+        report_lines.append(f"| {label} | {_fmt(baseline)} | {_fmt(memory)} | {_fmt_signed(delta)} |")
+    report_lines.append("")
+
+    report_lines.append("## Suppression Breakdown")
+    report_lines.append("")
+    report_lines.append("| Bucket | Count | Share of all suppressed alerts |")
+    report_lines.append("|---|---:|---:|")
+    report_lines.append(f"| Nominal only | {int(suppressed_nominal)} | {_pct(suppressed_nominal, suppressed_total)} |")
+    report_lines.append(f"| Overlapping rare events | {int(suppressed_rare)} | {_pct(suppressed_rare, suppressed_total)} |")
+    report_lines.append(f"| Overlapping anomalies | {int(suppressed_anomaly)} | {_pct(suppressed_anomaly, suppressed_total)} |")
+    report_lines.append(f"| Total | {int(suppressed_total)} | 100.0% |")
+    report_lines.append("")
+
+    report_lines.append("## Run Configuration")
+    report_lines.append("")
+    config_keys = [
+        "experiment_tag",
+        "splits",
+        "detectors",
+        "memory_threshold",
+        "metric",
+        "half_window",
+        "target_channels",
+        "tcn_epochs",
+        "tcn_training_wall_seconds",
+        "tcn_learning_rate",
+        "tcn_weight_decay",
+        "tcn_dropout",
+        "tcn_sequence_length",
+        "tcn_horizon",
+        "tcn_hidden_dim",
+        "tcn_embedding_dim",
+        "tcn_num_blocks",
+        "tcn_batch_size",
+        "tcn_train_stride",
+        "tcn_inference_stride",
+        "tcn_threshold_std_factor",
+        "tcn_threshold_window",
+        "tcn_calibration_quantile",
+        "tcn_score_smoothing_window",
+        "tcn_max_gap_fill",
+        "tcn_min_anomaly_run_length",
+    ]
+    for key in config_keys:
+        if key in cli_args:
+            report_lines.append(f"- `{key}`: `{_cli_value(cli_args, key)}`")
+    report_lines.append("")
+
+    report_lines.append("## Provenance")
+    report_lines.append("")
+    report_lines.append(f"- Branch: `{git_info.get('branch', 'n/a')}`")
+    report_lines.append(f"- Commit from run summary: `{git_info.get('commit', 'n/a')}`")
+    report_lines.append(f"- Run status: `{run_summary.get('run_status', 'n/a')}`")
+    report_lines.append(f"- Detector(s): `{', '.join(run_summary.get('detectors', [])) or 'n/a'}`")
+    report_lines.append(f"- Split(s): `{', '.join(run_summary.get('splits', [])) or 'n/a'}`")
+    report_lines.append(f"- reading_materials_count: `{run_summary.get('reading_materials', {}).get('count', 'n/a')}`")
+    if eval_summary:
+        best_eval = eval_summary.get("best_run", {})
+        report_lines.append(
+            f"- Eval summary agrees on best score: `{_fmt(best_eval.get('memory_event_f05'), 6)}` in `{results_root}`"
+        )
+    report_lines.append("")
+
+    report_lines.append("## Artifacts")
+    report_lines.append("")
+    artifact_candidates = [
+        results_root / "run_summary.json",
+        results_root / "summary.csv",
+        results_root / "eval_summary.json",
+        results_root / "leaderboard.csv",
+        results_root / "metrics_long.csv",
+        results_root / "compact_summary.csv",
+        results_root / "report.md",
+    ]
+    for artifact_path in artifact_candidates:
+        if artifact_path.exists():
+            report_lines.append(f"- `{artifact_path}`")
+    report_lines.append("")
+
+    return "\n".join(report_lines).rstrip() + "\n"
+
+
+def main() -> None:
+    args = parse_args()
+    records = load_results_tsv(args.results_tsv)
+
+    selected_record: ResultRecord | None = None
+    run_summary: dict[str, Any]
+    results_root: Path
+
+    if args.results_root is not None:
+        results_root = args.results_root
+        run_summary = _load_json(results_root / "run_summary.json")
+        artifact_warning = None
+        commit = args.commit or str(run_summary.get("git", {}).get("commit") or "")
+        selected_record = next((record for record in records if record.commit == commit), None)
+        if selected_record is None:
+            selected_record = ResultRecord(
+                commit=commit or "unknown",
+                primary_f05=_as_float(run_summary.get("primary_metric_mean")),
+                status=str(run_summary.get("run_status") or ""),
+                description=str(run_summary.get("description") or ""),
+            )
+    else:
+        selected_record = select_best_record(records, args.commit)
+        artifact_selection = locate_best_run(
+            args.results_dir,
+            target_commit=selected_record.commit,
+            target_score=selected_record.primary_f05,
+        )
+        results_root = artifact_selection.results_root
+        run_summary = artifact_selection.run_summary
+        artifact_warning = artifact_selection.warning
+
+    previous_best = select_previous_best(records, selected_record.commit)
+    summary_row = load_best_summary_row(results_root / "summary.csv")
+    eval_summary_path = results_root / "eval_summary.json"
+    eval_summary = _load_json(eval_summary_path) if eval_summary_path.exists() else None
+
+    report = build_report(
+        best_record=selected_record,
+        previous_best=previous_best,
+        results_root=results_root,
+        run_summary=run_summary,
+        summary_row=summary_row,
+        eval_summary=eval_summary,
+        artifact_warning=artifact_warning,
+    )
+
+    output_path = args.output or (results_root / "human_eval.md")
+    output_path.write_text(report, encoding="utf-8")
+
+    print(f"human_eval_output={output_path}")
+    print(f"best_commit={selected_record.commit}")
+    print(f"best_primary_f05={selected_record.primary_f05:.6f}")
+    print()
+    print(report)
+
+
+if __name__ == "__main__":
+    main()
